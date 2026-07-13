@@ -1,0 +1,35 @@
+# --- secrets / credentials: NEVER commit ---
+secrets/
+*.key
+*.pem
+*.token
+http-token
+.env
+.env.*
+
+# --- runtime artifacts ---
+*.jpg
+*.jpeg
+*.png
+frame.jpg
+nav_state.json
+nav_goal.json
+vision.txt
+*.log
+.disarmed
+
+# --- models (large binaries; see README for how to fetch) ---
+*.onnx
+*.weights
+*.engine
+models/
+
+# --- python ---
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+
+# --- os / editor ---
+.DS_Store
+*.swp
