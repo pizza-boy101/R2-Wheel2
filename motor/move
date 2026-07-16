@@ -1,0 +1,44 @@
+#!/bin/sh
+# move — send a drive command to the robot's Arduino over USB serial.
+# usage: move <forward|back|left|right|cw|ccw|stop|raw|arm|disarm> [speed 0..1] [seconds]
+PORT="${ROBOT_SERIAL:-$(ls /dev/ttyUSB* /dev/ttyACM* 2>/dev/null | head -n1)}"
+WS="$(cd "$(dirname "$0")" && pwd)"
+DISARM="$WS/.disarmed"
+[ -n "$PORT" ] || { echo "no serial port found" >&2; exit 1; }
+stty -F "$PORT" 115200 cs8 -cstopb -parenb raw -hupcl -echo 2>/dev/null
+cmd="$1"; spd="${2:-0.9}"; secs="$3"
+
+# --- kill switch ---
+case "$cmd" in
+  disarm|kill) printf '%s\n' "S" > "$PORT" 2>/dev/null; : > "$DISARM"; echo "DISARMED — motion blocked until 'move arm'"; exit 0 ;;
+  arm|resume)  rm -f "$DISARM"; echo "ARMED — motion allowed"; exit 0 ;;
+esac
+# while disarmed, refuse all motion (stop is always allowed)
+if [ -f "$DISARM" ] && [ -n "$cmd" ] && [ "$cmd" != "stop" ]; then
+  printf '%s\n' "S" > "$PORT"
+  echo "DISARMED — motion blocked (kill switch engaged; run: ./move arm)" >&2
+  exit 3
+fi
+
+case "$cmd" in
+  forward) V="V 0 $spd 0" ;;
+  back)    V="V 0 -$spd 0" ;;
+  right)   V="V $spd 0 0" ;;
+  left)    V="V -$spd 0 0" ;;
+  cw)      V="V 0 0 $spd" ;;
+  ccw)     V="V 0 0 -$spd" ;;
+  stop|"") printf '%s\n' "S" > "$PORT"; exit 0 ;;
+  raw)     printf '%s\n' "$2" > "$PORT"; exit 0 ;;
+  *) echo "usage: move <forward|back|left|right|cw|ccw|stop|raw|arm|disarm> [speed] [seconds]" >&2; exit 2 ;;
+esac
+if [ -n "$secs" ]; then
+  ticks=$(awk "BEGIN{t=int($secs/0.15); if(t<1)t=1; print t}")
+  i=0
+  while [ "$i" -lt "$ticks" ]; do
+    [ -f "$DISARM" ] && { printf '%s\n' "S" > "$PORT"; echo "disarmed mid-move — stopped" >&2; exit 3; }
+    printf '%s\n' "$V" > "$PORT"; sleep 0.15; i=$((i+1))
+  done
+  printf '%s\n' "S" > "$PORT"
+else
+  printf '%s\n' "$V" > "$PORT"
+fi
