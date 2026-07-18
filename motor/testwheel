@@ -1,0 +1,23 @@
+#!/bin/sh
+# testwheel — spin ONE motor channel at a time to identify wheels + direction.
+# usage: ./testwheel <1|2|3|4> [speed] [seconds]
+#   1 = L298 #1 channel A (back)      2 = L298 #1 channel B (back)
+#   3 = L298 #2 channel A (front)     4 = L298 #2 channel B (front)
+# speed may be negative to spin the other way, e.g. ./testwheel 1 -0.9
+PORT="${ROBOT_SERIAL:-$(ls /dev/ttyUSB* /dev/ttyACM* 2>/dev/null | head -n1)}"
+[ -n "$PORT" ] || { echo "no serial port found" >&2; exit 1; }
+stty -F "$PORT" 115200 cs8 -cstopb -parenb raw -hupcl -echo 2>/dev/null
+n="$1"; spd="${2:-0.9}"; secs="${3:-2.5}"
+case "$n" in
+  1) M="M $spd 0 0 0" ;;
+  2) M="M 0 $spd 0 0" ;;
+  3) M="M 0 0 $spd 0" ;;
+  4) M="M 0 0 0 $spd" ;;
+  *) echo "usage: ./testwheel <1|2|3|4> [speed] [seconds]   (speed can be negative)" >&2; exit 2 ;;
+esac
+# resend faster than the firmware's 300ms watchdog so it keeps spinning
+ticks=$(awk "BEGIN{t=int($secs/0.15); if(t<1)t=1; print t}")
+i=0
+while [ "$i" -lt "$ticks" ]; do printf '%s\n' "$M" > "$PORT"; sleep 0.15; i=$((i+1)); done
+printf '%s\n' "S" > "$PORT"
+echo "channel $n done (speed $spd, ${secs}s)"
