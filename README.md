@@ -1,138 +1,128 @@
-# R2-Wheel2 — a voice-driven, self-navigating mecanum robot car
+# R2-Wheel2 🤖🛞
 
-A hobby autonomous ground robot built on an **NVIDIA Jetson Orin Nano**. You talk to
-it and it drives; it sees the world through a single camera and a monocular-depth model
-running on its GPU. It's a study in **splitting a robot's "brain" across two clocks** —
-a cloud voice model for intent, and an on-board perception loop for reflexes.
+A little robot car I built that you can **talk to** and that **drives itself around** using
+its camera. It runs on an NVIDIA Jetson Orin Nano, and the whole thing started because I
+wanted an excuse to learn robotics and mess with the new realtime voice AI stuff at the
+same time.
 
-> Personal project. Not affiliated with any employer. All code here is my own hobby work.
+It's very much a work-in-progress hobby project — but it already listens, talks back, and
+sees well enough to know when something's in front of it.
+
+> Personal side project, built in my own time. Not affiliated with anyone I work for.
 
 ---
 
-## What it does
+## What it can do right now
 
-- **Talk to it, and it moves.** A full-duplex voice loop (OpenAI Realtime API) listens,
-  reasons, and speaks back with sub-second latency, driving the car through
-  function-calls (`drive` / `stop` / `look`). Barge-in supported — interrupt it and it
-  stops talking.
-- **It sees.** A monocular depth model (MiDaS-small) runs on the Jetson GPU at ~22 fps,
-  turning the camera feed into a live free-space estimate (how close is the nearest
-  obstacle, left / center / right).
-- **It won't drive blind.** Firmware enforces a 300 ms command watchdog, and a software
-  kill switch (`.disarmed`) can block all motion instantly.
+- 🎙️ **You talk, it drives.** I hooked it up to the OpenAI Realtime API, so you just say
+  "move forward for a sec" or "stop" and it does it — replies out loud in about a second,
+  and you can cut it off mid-sentence and it'll shut up and listen.
+- 👀 **It sees.** There's a depth model running on the Jetson's GPU that figures out roughly
+  how far away stuff is from a single camera, ~22 times a second. So it has a real sense of
+  "wall on the left, open space ahead."
+- 🛑 **It tries not to hurt itself (or me).** The motor firmware auto-stops if it stops
+  getting commands, and there's a kill switch that halts everything instantly.
 
-## The idea: a two-clock brain
+## The main idea I'm proud of
 
-Navigating through the cloud alone doesn't work — the ~1 s round-trip means the robot
-decides to stop a meter after it should have, and streaming every frame up is slow and
-expensive. So the brain is split:
+My first instinct was "just send the camera to the cloud AI and let it drive." That does
+**not** work — there's about a 1-second round trip, so the car decides to stop about a meter
+*after* it should have, and streaming video to the cloud is slow and pricey.
 
-```
-          ┌─────────────────────────── cloud (intermittent, ~1 s) ───────────────────────────┐
-  voice ─▶ │  OpenAI Realtime API: understands speech, sets intent, calls drive/stop/look     │
-          └──────────────────────────────────────────┬───────────────────────────────────────┘
-                                                      │ goals / commands
-          ┌───────────────────────────────────────── ▼ ─── on-board (continuous, ~22 fps) ────┐
- camera ─▶ │  perception.py:  MiDaS depth ──▶ free-space + (optional) target tracker           │
-          │  nav loop (WIP):  reactive obstacle avoidance + goal-directed servoing              │
-          └──────────────────────────────────────────┬───────────────────────────────────────┘
-                                                      │ serial (V/M/S @ 115200)
-          ┌───────────────────────────────────────── ▼ ────────────────────────────────────────┐
-   motors ◀ │  ATmega328P firmware:  mecanum inverse kinematics + 300 ms watchdog failsafe       │
-          └────────────────────────────────────────────────────────────────────────────────────┘
-```
-
-The cloud sets *intent* ("head toward the doorway"); the on-board loop handles the
-*reflexes* (don't hit the wall) at frame rate, with no network in the control path.
-
-## Hardware
-
-| Part | Component |
-|------|-----------|
-| Compute | NVIDIA Jetson Orin Nano (JetPack 5 / L4T R35), headless over Wi-Fi |
-| Microcontroller | Keyestudio MAX (Arduino Uno-compatible, ATmega328P, CP2102 USB-UART) |
-| Motor drivers | 2× L298N dual H-bridge |
-| Drivetrain | 4× DC gear motors on mecanum wheels (X-roller layout) |
-| Camera | USB webcam (Creative Live! Cam Sync 1080p V2) |
-| Audio | Jabra Speak 510 USB speakerphone (mic + speaker) |
-| Power | 12 V pack for motors; Jetson on its own supply (see note below) |
-
-> **Power lesson learned the hard way:** never share one battery between the compute and
-> the motors. Motor inrush current sags the shared rail and browns-out the Jetson mid-GPU-
-> spike. Compute and motors get separate rails.
-
-## Repository layout
+So I split the brain into two parts running at two different speeds:
 
 ```
-firmware/mecanum_uno/   Arduino firmware: serial command interpreter + mecanum kinematics
-motor/move              board-agnostic drive script (V/M/S protocol, kill switch)
-motor/testwheel         per-wheel bring-up / calibration helper
-perception/perception.py   the always-on vision loop: depth → free-space → nav_state.json
-perception/depth_bench.py  GPU depth-model benchmark (cv2.dnn CUDA)
-voice/realtime_sidecar.py  the voice+drive loop (OpenAI Realtime API)
+  you talk ─▶  CLOUD (slow, ~1s):  the voice AI understands what you want
+                                    and decides the goal → "go that way"
+                    │
+                    ▼
+  camera ──▶  ON THE ROBOT (fast, ~22fps):  depth model + navigation loop
+                                    handle the reflexes → "don't hit that"
+                    │
+                    ▼
+  motors ◀── the Arduino runs the wheels + a safety timeout
 ```
 
-## How it works
+The cloud handles *what to do*; the robot itself handles *not crashing*, at camera speed,
+with nothing going over the network. That split is basically the whole trick.
 
-### Firmware (`firmware/mecanum_uno`)
-An ATmega328P speaks a tiny line protocol over USB serial @ 115200:
-- `V vx vy w` — body velocity (strafe, forward, yaw), each −1..1, run through mecanum
-  inverse kinematics and scaled so no wheel clips.
-- `M fl fr rl rr` — direct per-wheel drive (for calibration).
-- `S` — stop.
-Motors auto-stop if no valid command arrives within 300 ms, so a dropped link or a
-crashed host can never leave the car driving away.
+## The parts
 
-### Motor control (`motor/`)
-`move forward 0.8 1.5` drives forward at 0.8 for 1.5 s (re-sending faster than the
-watchdog so it keeps rolling), then stops. `move disarm` engages a kill switch that
-blocks all motion until `move arm`. `testwheel` spins one wheel at a time to identify
-wiring and direction.
+| Bit | What I used |
+|-----|-------------|
+| Brain | NVIDIA Jetson Orin Nano (runs headless over Wi-Fi) |
+| Motor controller | Keyestudio MAX (an Arduino Uno-compatible board) |
+| Motor drivers | 2× L298N H-bridges |
+| Wheels | 4 DC motors + mecanum wheels (so it can strafe sideways, which is cool) |
+| Eyes | a USB webcam |
+| Ears + mouth | a Jabra USB speakerphone |
+| Power | 12V battery for the motors, separate supply for the Jetson (learned this the hard way, see below) |
 
-### Perception (`perception/`)
-`perception.py` owns the camera, runs MiDaS-small on the GPU via OpenCV's CUDA DNN
-backend, and reduces each depth map to a compact `nav_state.json` (nearest obstacle per
-column + which direction is most open). It also publishes a throttled `frame.jpg` for
-the voice loop. `depth_bench.py` was the go/no-go test — it proved the model imports and
-runs at ~26 fps on the Orin before any control logic was written.
+## How the code is laid out
 
-### Voice (`voice/`)
-`realtime_sidecar.py` opens one websocket to the OpenAI Realtime API, streams mic audio
-up and voice audio down, and exposes `drive` / `stop` / `look` as function tools that
-bridge to the same `move` script. Vision is *hybrid*: an on-demand `look` (crisp photo)
-plus a silent, change-gated ambient frame push, so the model stays aware without
-paying to stream every frame. All OpenCV work runs off the audio event loop so playback
-never stutters.
+```
+firmware/mecanum_uno/   the Arduino code that actually turns the wheels
+motor/move              a script to drive it ("./move forward 0.8 1.5")
+motor/testwheel         spins one wheel at a time (for figuring out the wiring)
+perception/perception.py   the "seeing" loop: camera → depth → free space
+perception/depth_bench.py  a quick benchmark I wrote to check the GPU was fast enough
+voice/realtime_sidecar.py  the talk-to-it voice loop
+```
+
+### The firmware
+The Arduino listens for tiny text commands over USB (`V` = move like this, `M` = spin this
+one wheel, `S` = stop) and does the mecanum wheel math. The important safety bit: if it
+doesn't hear a command for 300ms it stops the motors on its own, so if the software crashes
+or the cable pops out, the car doesn't just drive off into a wall.
+
+### Seeing (perception)
+`perception.py` grabs frames from the camera and runs **MiDaS** (a depth model) on the GPU
+using OpenCV. That was the scary part — I wasn't sure the little Jetson could run it fast
+enough to be useful. So before writing any driving logic I wrote `depth_bench.py` just to
+check, and it hit ~26 fps, which was a huge relief. It turns each frame into a simple
+"how close is the nearest thing on the left / middle / right" readout.
+
+### Talking (voice)
+`realtime_sidecar.py` opens one connection to the OpenAI Realtime API and streams the mic up
+and the voice down. The AI can call `drive`, `stop`, and `look` (take a photo) as tools. One
+thing that took me a while: I was doing the image processing on the same thread as the audio,
+and it made the voice stutter — moving that to a background thread fixed it.
+
+## Stuff that went wrong (the honest section)
+
+- 💀 **I killed two ESP32 boards.** The first one's flash chip died (I think from mechanical
+  stress when I boxed everything up), the second one shorted and overheated while I was
+  rewiring it. I switched to the Arduino-compatible board after that.
+- 🔌 **A "broken robot" that was just a bad cable.** Spent ages convinced a board was dead
+  because it wouldn't show up over USB — turned out the USB cable was charge-only. Now that's
+  the first thing I check.
+- 🔋 **Brownouts.** The robot kept randomly rebooting under load. Turned out I was running the
+  Jetson off the same tired 12V battery as the motors, and the current spikes from the GPU +
+  motors sagged the voltage enough to reset the whole computer. **Lesson: give the computer
+  and the motors their own power.** Fixed it and it's been rock solid since.
 
 ## Running it
 
 ```sh
-# firmware: flash with arduino-cli (FQBN arduino:avr:uno) to the ATmega328P board
+# flash the Arduino firmware
 arduino-cli upload --fqbn arduino:avr:uno -p /dev/ttyUSB0 firmware/mecanum_uno
 
-# perception (needs a MiDaS-small ONNX in models/ — see isl-org/MiDaS v2_1)
+# start the seeing loop (needs a MiDaS-small ONNX model in models/)
 python3 perception/perception.py
 
-# voice (needs an OpenAI API key; provide it out-of-band, never commit it)
+# start the voice loop (needs an OpenAI API key — kept out of the repo!)
 OPENAI_KEY_FILE=~/secrets/openai.key python3 voice/realtime_sidecar.py
 ```
 
-Depends on: OpenCV (with CUDA), NumPy, `websockets`, PulseAudio (`parec`/`paplay`), and
-the Jetson CUDA stack. The MiDaS ONNX model and all API keys are intentionally **not**
-in the repo (see `.gitignore`).
+You'll need OpenCV (built with CUDA), NumPy, `websockets`, and PulseAudio. The depth model
+and any API keys are deliberately **not** in this repo (see `.gitignore`) — you bring your own.
 
-## Build timeline
+## What I want to add next
 
-*(Commit history reconstructs the real development order; dates are approximate.)*
+- [ ] Actually let it drive itself around obstacles (right now it *sees* them, it doesn't
+      steer around them yet).
+- [ ] "Go to the doorway" — have the voice AI pick a target and let the robot navigate to it.
+- [ ] Get a proper depth camera so the distances are real measurements, not estimates — and
+      maybe try mapping a room.
 
-1. **Motor bring-up** — mecanum firmware + serial driver; first controlled motion.
-2. **Calibration** — per-wheel identification and direction/inversion mapping.
-3. **Voice control** — full-duplex voice→drive via the OpenAI Realtime API.
-4. **Perception** — monocular depth on the GPU; the free-space foundation for navigation.
-
-## Roadmap
-
-- [ ] Reactive nav loop: creep + stop/steer on obstacles (threshold calibrated vs. a wall).
-- [ ] Goal-directed navigation: cloud names a target, a local tracker servos toward it
-      while the depth layer vetoes unsafe motion.
-- [ ] Depth-camera upgrade (RealSense / OAK-D) for metric depth and eventual mapping.
+Thanks for reading! This has been the most fun I've had learning something in a while. 🛠️
