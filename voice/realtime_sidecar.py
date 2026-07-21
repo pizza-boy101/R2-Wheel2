@@ -77,15 +77,17 @@ INSTRUCTIONS = (
     "moves; short bursts followed by re-checking are safe. Call the look tool only when the user asks "
     "what you see, or when you are about to drive toward a specific target and need a crisp view to aim "
     "or confirm the path is clear. "
-    "SEARCHING: when told to turn or move until you see something, use SHORT bursts (~0.3 s) and rely "
-    "on the ambient snapshots between bursts (call look only if the ambient view is stale). There is "
-    "~1 burst of reaction lag, so STOP the instant the target first edges into frame rather than "
-    "waiting for it centered — you can nudge back to center after stopping."
+    "SEARCHING: when told to turn or move until you see something, do NOT tap in tiny increments. "
+    "Start a CONTINUOUS turn at a steady moderate speed (call drive with the full duration and keep "
+    "re-issuing it so the motion never pauses) and watch the ambient camera snapshots as it sweeps. "
+    "Driving is non-blocking, so you stay fully aware while moving. The INSTANT the target first edges "
+    "into frame, call stop immediately (stop preempts the turn). Turning smoothly and stopping on sight "
+    "is what makes the reaction fast; stop-and-recheck tapping is slow and defeats the point."
 )
 
 TOOLS = [
     {"type": "function", "name": "drive",
-     "description": "Drive the car in one direction for a short burst.",
+     "description": "Drive/turn the car in one direction. Runs in the background (non-blocking) for the given duration; you stay aware while it moves. Any new drive replaces the current motion, and stop halts it early.",
      "parameters": {"type": "object", "properties": {
          "direction": {"type": "string", "enum": ["forward", "back", "left", "right", "cw", "ccw"],
                        "description": "forward/back, left/right = strafe, cw/ccw = rotate in place"},
@@ -149,7 +151,23 @@ def _clamp(v, lo, hi, d):
         return d
 
 
+# background handle for the current motion, so a turn can run non-blocking (the event
+# loop stays free to see + react mid-turn) and stop / the next command can preempt it.
+_motion_proc = None
+
+
+def _kill_motion():
+    global _motion_proc
+    if _motion_proc is not None and _motion_proc.poll() is None:
+        try:
+            _motion_proc.terminate()
+        except Exception:
+            pass
+    _motion_proc = None
+
+
 def invoke_tool(name, args_json):
+    global _motion_proc
     try:
         args = json.loads(args_json or "{}")
     except Exception:
@@ -159,11 +177,14 @@ def invoke_tool(name, args_json):
             d = args.get("direction", "forward")
             spd = _clamp(args.get("speed", 0.9), 0.0, 1.0, 0.9)
             secs = _clamp(args.get("seconds", 1.0), 0.1, 2.0, 1.0)
-            r = subprocess.run([MOVE, d, "%.2f" % spd, "%.2f" % secs],
-                               capture_output=True, text=True, timeout=secs + 6)
-            detail = (r.stdout + r.stderr).strip()
-            return {"ok": r.returncode == 0, "detail": detail or ("drove %s at %.2f for %.1fs" % (d, spd, secs))}
+            _kill_motion()   # a new command preempts any in-flight turn
+            # non-blocking: the move script keeps resending for `secs` in the background,
+            # so the event loop stays free to receive frames and issue a stop mid-turn.
+            _motion_proc = subprocess.Popen([MOVE, d, "%.2f" % spd, "%.2f" % secs],
+                                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return {"ok": True, "detail": "driving %s at %.2f for up to %.1fs (non-blocking)" % (d, spd, secs)}
         if name == "stop":
+            _kill_motion()   # preempt the in-flight turn, then halt
             subprocess.run([MOVE, "stop"], capture_output=True, timeout=5)
             return {"ok": True, "detail": "stopped"}
         # note: "look" is handled specially in the receiver (it attaches an image), not here
