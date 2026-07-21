@@ -73,8 +73,9 @@ INSTRUCTIONS = (
     "'I'll check', 'hold on'. Call tools silently, then speak ONCE with the real answer or result "
     "(what you actually see, the status) — never a placeholder acknowledgement. "
     "To move, call the drive tool with a direction, "
-    "a speed from 0 to 1 (default to FULL speed, 1.0, unless the user asks to go slower), and a "
-    "short duration in seconds — prefer brief bursts (0.5 to 1.5 s) and re-check rather than long "
+    "a speed from 0.6 to 1.0 (NEVER below 0.6 — below that the motors just stall and buzz and the car "
+    "won't move; default to full speed 1.0 unless the user asks to go slower), and a short duration "
+    "in seconds — prefer brief bursts (0.5 to 1.5 s) and re-check rather than long "
     "blind drives. Call stop the instant the user says stop. "
     "VISION: you receive ambient camera snapshots automatically whenever the view changes, so you "
     "are already aware of the scene most of the time — treat those as background awareness and only "
@@ -82,12 +83,12 @@ INSTRUCTIONS = (
     "moves; short bursts followed by re-checking are safe. Call the look tool only when the user asks "
     "what you see, or when you are about to drive toward a specific target and need a crisp view to aim "
     "or confirm the path is clear. "
-    "SEARCHING: when told to turn or move until you see something, do NOT tap in tiny increments and "
-    "do NOT spin fast. Start a CONTINUOUS but SLOW turn (speed about 0.3 — this overrides the full-speed "
-    "default) and keep re-issuing it so the motion never pauses, watching the ambient snapshots as it "
-    "sweeps. Driving is non-blocking, so you stay aware while moving. There is ~1-2 s of reaction lag, so "
-    "a fast spin overshoots far past the target before you can react; a slow spin keeps the overshoot "
-    "small. Call stop the INSTANT the target first edges into frame (stop preempts the turn)."
+    "SEARCHING: when told to turn or move until you see something, do NOT tap in tiny increments. "
+    "Start a CONTINUOUS turn at the SLOWEST speed that still reliably moves the car, which is 0.6 "
+    "(never lower — below 0.6 it just stalls and buzzes), and keep re-issuing it so the motion never "
+    "pauses, watching the ambient snapshots as it sweeps. Driving is non-blocking, so you stay aware "
+    "while moving. There is ~1-2 s of reaction lag, so expect some overshoot even at 0.6; call stop "
+    "the INSTANT the target first edges into frame (stop preempts the turn)."
 )
 
 TOOLS = [
@@ -96,7 +97,7 @@ TOOLS = [
      "parameters": {"type": "object", "properties": {
          "direction": {"type": "string", "enum": ["forward", "back", "left", "right", "cw", "ccw"],
                        "description": "forward/back, left/right = strafe, cw/ccw = rotate in place"},
-         "speed": {"type": "number", "description": "0..1, default 1 (full speed)"},
+         "speed": {"type": "number", "description": "0.6..1 (below 0.6 the motors stall and the car won't move), default 1"},
          "seconds": {"type": "number", "description": "burst length, keep <= 2"}},
          "required": ["direction"]}},
     {"type": "function", "name": "stop",
@@ -180,7 +181,7 @@ def invoke_tool(name, args_json):
     try:
         if name == "drive":
             d = args.get("direction", "forward")
-            spd = _clamp(args.get("speed", 1.0), 0.0, 1.0, 1.0)
+            spd = _clamp(args.get("speed", 1.0), 0.6, 1.0, 1.0)   # 0.6 floor: below this the motors stall/buzz
             secs = _clamp(args.get("seconds", 1.0), 0.1, 2.0, 1.0)
             _kill_motion()   # a new command preempts any in-flight turn
             # non-blocking: the move script keeps resending for `secs` in the background,
