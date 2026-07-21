@@ -51,6 +51,7 @@ RATE = 24000
 WORKSPACE = env("ROBOT_WORKSPACE", os.path.join(HOME, "robot", "workspace"))
 MOVE = os.path.join(WORKSPACE, "move")
 FRAME_PATH = os.path.join(WORKSPACE, "frame.jpg")   # written by the perception loop
+NAV_STATE = os.path.join(WORKSPACE, "nav_state.json")  # perception's structured free-space output
 # hybrid vision: on-demand look (crisp) + silent change-gated ambient push (cheap)
 LOOK_MAXDIM = int(env("VISION_LOOK_MAXDIM", "512"))
 LOOK_QUALITY = int(env("VISION_LOOK_QUALITY", "65"))
@@ -60,7 +61,11 @@ PUSH_QUALITY = int(env("VISION_PUSH_QUALITY", "55"))
 PUSH_POLL = float(env("VISION_PUSH_POLL", "0.7"))          # how often to check for change
 PUSH_CHANGE_THRESH = float(env("VISION_PUSH_THRESH", "8"))  # mean abs pixel delta (0-255) to count as changed
 PUSH_MIN_INTERVAL = float(env("VISION_PUSH_MIN_INTERVAL", "1.5"))  # rate cap between ambient pushes
-VOICE_QUIET_GAP = float(env("VISION_QUIET_GAP", "3.0"))  # never push an ambient frame within this many s of voice activity
+VOICE_QUIET_GAP = float(env("VISION_QUIET_GAP", "3.0"))  # (legacy image push) don't push a frame within this many s of voice
+TEXT_POLL = float(env("VISION_TEXT_POLL", "0.4"))          # how often to check perception state
+TEXT_MIN_INTERVAL = float(env("VISION_TEXT_MIN_INTERVAL", "1.0"))  # min seconds between text situational updates
+TEXT_QUIET_GAP = float(env("VISION_TEXT_QUIET_GAP", "1.0"))        # keep text updates just clear of live speech
+LOOM_TEXT = float(env("VISION_LOOM_TEXT", "120"))                  # loom above this => 'something getting closer'
 SOURCE_MATCH = env("LISTEN_SOURCE_MATCH", "jabra").lower()
 SINK_MATCH = env("SPEECH_SINK_MATCH", "jabra").lower()
 SMOKE = env("REALTIME_SMOKE", "0") == "1"
@@ -78,18 +83,19 @@ INSTRUCTIONS = (
     "won't move; default to full speed 1.0 unless the user asks to go slower), and a short duration "
     "in seconds — prefer brief bursts (0.5 to 1.5 s) and re-check rather than long "
     "blind drives. Call stop the instant the user says stop. "
-    "VISION: you receive ambient camera snapshots automatically whenever the view changes, so you "
-    "are already aware of the scene most of the time — treat those as background awareness and only "
-    "mention them if something important appears (e.g. an obstacle). Do NOT call look before ordinary "
-    "moves; short bursts followed by re-checking are safe. Call the look tool only when the user asks "
-    "what you see, or when you are about to drive toward a specific target and need a crisp view to aim "
-    "or confirm the path is clear. "
+    "VISION: you continuously receive short text camera updates like '(camera) most open left; target "
+    "in view on the right' — which direction is most open, whether something is getting closer, and "
+    "whether a tracked target is in view. This is your CONSTANT background awareness, so you almost "
+    "always already know the current scene without looking; use it directly. Do NOT call look for "
+    "ordinary moves or to check those things — you already have them. Call the look tool ONLY when the "
+    "user asks what you see or you must actually identify/describe something with your own eyes. "
     "SEARCHING: when told to turn or move until you see something, do NOT tap in tiny increments. "
     "Start a CONTINUOUS turn at the SLOWEST speed that still reliably moves the car, which is 0.6 "
     "(never lower — below 0.6 it just stalls and buzzes), and keep re-issuing it so the motion never "
-    "pauses, watching the ambient snapshots as it sweeps. Driving is non-blocking, so you stay aware "
-    "while moving. There is ~1-2 s of reaction lag, so expect some overshoot even at 0.6; call stop "
-    "the INSTANT the target first edges into frame (stop preempts the turn)."
+    "pauses, watching the ambient camera updates as it sweeps (they tell you the instant the target "
+    "comes into view). Driving is non-blocking, so you stay aware while moving. There is ~1-2 s of "
+    "reaction lag, so expect some overshoot even at 0.6; call stop the INSTANT an update says the "
+    "target is in view (stop preempts the turn)."
 )
 
 TOOLS = [
@@ -264,6 +270,38 @@ def _log_task_death(task):
         log("[task died] %r" % exc)
 
 
+# ---------- perception state -> compact text (cheap, constant situational awareness) ----------
+def read_nav_state():
+    """Perception's latest structured free-space (None if missing or stale)."""
+    try:
+        with open(NAV_STATE) as f:
+            st = json.load(f)
+        if time.time() - st.get("ts", 0) > 1.0:
+            return None
+        return st
+    except Exception:
+        return None
+
+
+def scene_summary(st):
+    """One short line describing what the camera sees, for near-constant awareness."""
+    clearest = st.get("clearest", "c")
+    loom = st.get("loom", 0) or 0
+    tg = st.get("target", {}) or {}
+    dirword = {"l": "left", "c": "center", "r": "right"}.get(clearest, "center")
+    parts = ["most open %s" % dirword]
+    if loom > LOOM_TEXT:
+        parts.append("something getting closer ahead")
+    if tg.get("active"):
+        if tg.get("lost"):
+            parts.append("target lost")
+        else:
+            b = tg.get("bearing", 0.0)
+            where = "centered" if abs(b) < 0.08 else ("on the left" if b < 0 else "on the right")
+            parts.append("target in view %s" % where)
+    return "; ".join(parts)
+
+
 # ---------- audio playback (paplay raw); barge-in = kill+respawn to drop buffer ----------
 class Player:
     def __init__(self, sink):
@@ -433,37 +471,32 @@ async def main():
                     elif t == "error":
                         log("[error] %s" % json.dumps(evt.get("error", evt))[:300])
 
-            async def vision_push():
-                """Ambient awareness: when the camera view changes, silently drop ONE
-                small frame into context (no response.create -> no chatter, no extra
-                response cost). Rate-capped. Static scene -> nothing sent."""
-                if not _CV2:
-                    log("cv2 unavailable -> ambient vision push disabled")
-                    return
+            async def ambient_text():
+                """Cheap, near-constant situational awareness: summarize perception's
+                nav_state as one short line and drop it into context when it changes.
+                Text (not images) -> ~free, fast, and doesn't clog the voice turn-taking."""
                 prev = None
                 last_push = 0.0
                 while not stop_event.is_set():
-                    await asyncio.sleep(PUSH_POLL)
-                    # all cv2 work runs off the event loop so it never stalls audio playback
-                    thumb = await to_thread(frame_thumb)
-                    if thumb is None:
+                    await asyncio.sleep(TEXT_POLL)
+                    st = read_nav_state()
+                    if st is None:
                         continue
-                    change = 0.0 if prev is None else float(np.mean(np.abs(thumb - prev)))
-                    prev = thumb
+                    summary = scene_summary(st)
                     now = time.monotonic()
-                    if (change > PUSH_CHANGE_THRESH and (now - last_push) > PUSH_MIN_INTERVAL
-                            and (now - last_activity["t"]) > VOICE_QUIET_GAP):   # not mid-conversation
-                        durl = await to_thread(frame_data_url, PUSH_MAXDIM, PUSH_QUALITY)
-                        if durl:
-                            await enqueue(image_item(
-                                durl, "(ambient camera update — background awareness only)", "low"))
-                            last_push = now
-                            log("ambient frame pushed (change=%.1f)" % change)
+                    if (summary != prev and (now - last_push) > TEXT_MIN_INTERVAL
+                            and (now - last_activity["t"]) > TEXT_QUIET_GAP):
+                        await enqueue({"type": "conversation.item.create", "item": {
+                            "type": "message", "role": "user",
+                            "content": [{"type": "input_text", "text": "(camera) " + summary}]}})
+                        prev = summary
+                        last_push = now
+                        log("ambient text: %s" % summary)
 
             tasks = [asyncio.create_task(sender()), asyncio.create_task(receiver())]
             if not SMOKE:
                 tasks.append(asyncio.create_task(mic()))
-                tasks.append(asyncio.create_task(vision_push()))
+                tasks.append(asyncio.create_task(ambient_text()))
             for tk in tasks:
                 tk.add_done_callback(_log_task_death)
 
