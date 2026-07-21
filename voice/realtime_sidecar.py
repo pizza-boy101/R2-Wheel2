@@ -60,6 +60,7 @@ PUSH_QUALITY = int(env("VISION_PUSH_QUALITY", "55"))
 PUSH_POLL = float(env("VISION_PUSH_POLL", "0.7"))          # how often to check for change
 PUSH_CHANGE_THRESH = float(env("VISION_PUSH_THRESH", "8"))  # mean abs pixel delta (0-255) to count as changed
 PUSH_MIN_INTERVAL = float(env("VISION_PUSH_MIN_INTERVAL", "1.5"))  # rate cap between ambient pushes
+VOICE_QUIET_GAP = float(env("VISION_QUIET_GAP", "3.0"))  # never push an ambient frame within this many s of voice activity
 SOURCE_MATCH = env("LISTEN_SOURCE_MATCH", "jabra").lower()
 SINK_MATCH = env("SPEECH_SINK_MATCH", "jabra").lower()
 SMOKE = env("REALTIME_SMOKE", "0") == "1"
@@ -321,6 +322,7 @@ async def main():
     async def session_once():
         """One connection lifecycle; returns when the socket drops or stop_event fires."""
         send_q = asyncio.Queue()          # fresh per-connection queue (drops stale events on reconnect)
+        last_activity = {"t": 0.0}        # monotonic time of last voice activity; gates ambient pushes
 
         async def enqueue(evt):
             await send_q.put(evt)
@@ -382,6 +384,10 @@ async def main():
                 async for raw in ws:
                     evt = json.loads(raw)
                     t = evt.get("type", "")
+                    if t in ("input_audio_buffer.speech_started",
+                             "conversation.item.input_audio_transcription.completed",
+                             "response.output_audio.delta", "response.output_audio_transcript.done"):
+                        last_activity["t"] = time.monotonic()   # keep ambient pushes clear of live conversation
                     if t == "session.created":
                         log("[session created]")
                     elif t == "session.updated":
@@ -445,7 +451,8 @@ async def main():
                     change = 0.0 if prev is None else float(np.mean(np.abs(thumb - prev)))
                     prev = thumb
                     now = time.monotonic()
-                    if change > PUSH_CHANGE_THRESH and (now - last_push) > PUSH_MIN_INTERVAL:
+                    if (change > PUSH_CHANGE_THRESH and (now - last_push) > PUSH_MIN_INTERVAL
+                            and (now - last_activity["t"]) > VOICE_QUIET_GAP):   # not mid-conversation
                         durl = await to_thread(frame_data_url, PUSH_MAXDIM, PUSH_QUALITY)
                         if durl:
                             await enqueue(image_item(
