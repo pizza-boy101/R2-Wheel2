@@ -314,15 +314,18 @@ async def main():
     url = "wss://api.openai.com/v1/realtime?model=%s" % MODEL
     headers = {"Authorization": "Bearer " + key}   # GA API: no OpenAI-Beta header (beta shape is disabled)
 
-    send_q = asyncio.Queue()          # serialize all outgoing events onto the socket
     player = Player(sink)
     stop_event = asyncio.Event()
 
-    async def enqueue(evt):
-        await send_q.put(evt)
+    async def session_once():
+        """One connection lifecycle; returns when the socket drops or stop_event fires."""
+        send_q = asyncio.Queue()          # fresh per-connection queue (drops stale events on reconnect)
 
-    try:
-        async with ws_connect(url, additional_headers=headers, max_size=None) as ws:
+        async def enqueue(evt):
+            await send_q.put(evt)
+
+        async with ws_connect(url, additional_headers=headers, max_size=None,
+                              ping_interval=15, ping_timeout=30) as ws:
             log("connected")
 
             # configure the session
@@ -456,20 +459,32 @@ async def main():
             for tk in tasks:
                 tk.add_done_callback(_log_task_death)
 
-            if SMOKE:
-                # safety timeout so smoke test always exits
-                try:
-                    await asyncio.wait_for(stop_event.wait(), timeout=30)
-                except asyncio.TimeoutError:
-                    log("smoke timeout")
+            waiter = asyncio.create_task(stop_event.wait())
+            try:
+                # proceed as soon as stop_event fires OR any task ends (e.g. a disconnect)
+                await asyncio.wait(tasks + [waiter], return_when=asyncio.FIRST_COMPLETED,
+                                   timeout=35 if SMOKE else None)
+                if SMOKE:
                     stop_event.set()
-            else:
-                await stop_event.wait()
+            finally:
+                for tk in tasks:
+                    tk.cancel()
+                waiter.cancel()
+                await asyncio.gather(*tasks, waiter, return_exceptions=True)
 
-            for tk in tasks:
-                tk.cancel()
-    except Exception as e:
-        log("fatal: %r" % e)
+    # ---- reconnect loop: survive Wi-Fi blips / keepalive ping timeouts ----
+    try:
+        while not stop_event.is_set():
+            try:
+                await session_once()
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                log("connection lost: %r" % e)
+            if SMOKE or stop_event.is_set():
+                break
+            log("reconnecting in 2s...")
+            await asyncio.sleep(2)
     finally:
         await player.close()
         log("realtime sidecar stopped")
