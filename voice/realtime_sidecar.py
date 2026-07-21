@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-Robot realtime sidecar — low-latency voice+drive control via the OpenAI Realtime API.
+Robot realtime sidecar: low-latency voice+drive control via the OpenAI Realtime API.
 
 For the "hear me, react, move NOW" use case: one bidirectional websocket to
 gpt-realtime, streaming mic audio up and voice audio down, with server-side semantic
 VAD and barge-in. The model drives the car through function tools (drive/stop/look)
-that bridge to the `move` script — so the firmware 300ms watchdog and the `.disarmed`
+that bridge to the `move` script, so the firmware 300ms watchdog and the `.disarmed`
 kill switch still apply. Runs on the host (uses parec/paplay + the shared workspace).
 
 Env (all optional):
@@ -50,7 +50,7 @@ VOICE = env("REALTIME_VOICE", "marin")
 RATE = 24000
 WORKSPACE = env("ROBOT_WORKSPACE", os.path.join(HOME, "robot", "workspace"))
 MOVE = os.path.join(WORKSPACE, "move")
-FRAME_PATH = os.path.join(WORKSPACE, "frame.jpg")   # written by the vision sidecar (YOLO now off)
+FRAME_PATH = os.path.join(WORKSPACE, "frame.jpg")   # written by the perception loop
 # hybrid vision: on-demand look (crisp) + silent change-gated ambient push (cheap)
 LOOK_MAXDIM = int(env("VISION_LOOK_MAXDIM", "512"))
 LOOK_QUALITY = int(env("VISION_LOOK_QUALITY", "65"))
@@ -59,7 +59,7 @@ PUSH_MAXDIM = int(env("VISION_PUSH_MAXDIM", "384"))
 PUSH_QUALITY = int(env("VISION_PUSH_QUALITY", "55"))
 PUSH_POLL = float(env("VISION_PUSH_POLL", "0.7"))          # how often to check for change
 PUSH_CHANGE_THRESH = float(env("VISION_PUSH_THRESH", "8"))  # mean abs pixel delta (0-255) to count as changed
-PUSH_MIN_INTERVAL = float(env("VISION_PUSH_MIN_INTERVAL", "4"))  # rate cap between ambient pushes
+PUSH_MIN_INTERVAL = float(env("VISION_PUSH_MIN_INTERVAL", "1.5"))  # rate cap between ambient pushes
 SOURCE_MATCH = env("LISTEN_SOURCE_MATCH", "jabra").lower()
 SINK_MATCH = env("SPEECH_SINK_MATCH", "jabra").lower()
 SMOKE = env("REALTIME_SMOKE", "0") == "1"
@@ -220,6 +220,22 @@ def func_output(call_id, obj):
         "type": "function_call_output", "call_id": call_id, "output": json.dumps(obj)}}
 
 
+async def to_thread(fn, *args):
+    """Run a blocking fn off the event loop. asyncio.to_thread is 3.9+; the Jetson
+    is on Python 3.8, so use run_in_executor for compatibility."""
+    return await asyncio.get_event_loop().run_in_executor(None, fn, *args)
+
+
+def _log_task_death(task):
+    """Surface a background task that died from an unhandled exception (otherwise
+    asyncio swallows it and the loop just goes quiet)."""
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        log("[task died] %r" % exc)
+
+
 # ---------- audio playback (paplay raw); barge-in = kill+respawn to drop buffer ----------
 class Player:
     def __init__(self, sink):
@@ -362,7 +378,7 @@ async def main():
                         if name == "look":
                             # ack the call, attach a fresh crisp photo, then let it respond.
                             # cv2 encode runs in a thread so it never stalls audio playback.
-                            durl = await asyncio.to_thread(frame_data_url, LOOK_MAXDIM, LOOK_QUALITY)
+                            durl = await to_thread(frame_data_url, LOOK_MAXDIM, LOOK_QUALITY)
                             await enqueue(func_output(call_id, {"ok": durl is not None,
                                                                "note": "camera photo attached" if durl else "camera unavailable"}))
                             if durl:
@@ -393,14 +409,14 @@ async def main():
                 while not stop_event.is_set():
                     await asyncio.sleep(PUSH_POLL)
                     # all cv2 work runs off the event loop so it never stalls audio playback
-                    thumb = await asyncio.to_thread(frame_thumb)
+                    thumb = await to_thread(frame_thumb)
                     if thumb is None:
                         continue
                     change = 0.0 if prev is None else float(np.mean(np.abs(thumb - prev)))
                     prev = thumb
                     now = time.monotonic()
                     if change > PUSH_CHANGE_THRESH and (now - last_push) > PUSH_MIN_INTERVAL:
-                        durl = await asyncio.to_thread(frame_data_url, PUSH_MAXDIM, PUSH_QUALITY)
+                        durl = await to_thread(frame_data_url, PUSH_MAXDIM, PUSH_QUALITY)
                         if durl:
                             await enqueue(image_item(
                                 durl, "(ambient camera update — background awareness only)", "low"))
@@ -411,6 +427,8 @@ async def main():
             if not SMOKE:
                 tasks.append(asyncio.create_task(mic()))
                 tasks.append(asyncio.create_task(vision_push()))
+            for tk in tasks:
+                tk.add_done_callback(_log_task_death)
 
             if SMOKE:
                 # safety timeout so smoke test always exits
