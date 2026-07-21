@@ -48,6 +48,7 @@ def env(n, d):
 
 
 MODEL = os.path.join(HOME, "robot", "models", "model-small.onnx")
+ENGINE = os.path.join(HOME, "robot", "models", "midas-small-fp16.trt")   # TensorRT FP16 (preferred)
 WORKSPACE = env("ROBOT_WORKSPACE", os.path.join(HOME, "robot", "workspace"))
 FRAME_OUT = os.path.join(WORKSPACE, "frame.jpg")      # we now PRODUCE this (was vision_sidecar's job)
 STATE = os.path.join(WORKSPACE, "nav_state.json")
@@ -55,7 +56,8 @@ GOAL = os.path.join(WORKSPACE, "nav_goal.json")
 
 INSIZE = 256
 MEAN = (123.675, 116.28, 103.53)          # MiDaS small (imagenet mean * 255)
-FPS_CAP = float(env("PERCEPTION_FPS_CAP", "12"))
+FPS_CAP = float(env("PERCEPTION_FPS_CAP", "20"))   # raised from 12: FP16 gives the headroom, and
+                                                   # fresher nav_state = lower reactive latency (old stack is off)
 STOP_NEAR = float(env("STOP_NEAR", "1000"))
 CAM_INDEX = int(env("CAM_INDEX", "0"))
 CAM_WIDTH = int(env("CAM_WIDTH", "1280"))
@@ -63,7 +65,11 @@ CAM_HEIGHT = int(env("CAM_HEIGHT", "720"))
 FRAME_WRITE_EVERY = float(env("FRAME_WRITE_EVERY", "0.25"))
 FRAME_QUALITY = int(env("FRAME_QUALITY", "80"))
 LOG_EVERY = float(env("PERCEPTION_LOG_EVERY", "0.5"))
-BAND_TOP = float(env("PERCEPTION_BAND_TOP", "0.45"))
+BAND_TOP = float(env("PERCEPTION_BAND_TOP", "0.30"))   # look AHEAD (mid frame), not the floor at the wheels
+BAND_BOT = float(env("PERCEPTION_BAND_BOT", "0.62"))
+LOOM_WINDOW = float(env("PERCEPTION_LOOM_WINDOW", "0.35"))  # s; loom = rise in center nearness over this window
+NEAR_EMA = float(env("PERCEPTION_NEAR_EMA", "0.6"))        # per-column smoothing weight on the new sample
+                                                          # (1.0 = off; ~0.6 kills single-frame noise, ~1 frame lag)
 
 _run = True
 
@@ -83,24 +89,95 @@ def open_camera():
     return cap
 
 
-def load_net():
-    net = cv2.dnn.readNetFromONNX(MODEL)
-    net.setPreferableBackend(cv2.dnn.DNN_BACKEND_CUDA)
-    net.setPreferableTarget(cv2.dnn.DNN_TARGET_CUDA)
-    return net
+def _blob(img):
+    return cv2.dnn.blobFromImage(img, 1 / 255.0, (INSIZE, INSIZE), MEAN, swapRB=True, crop=False)
 
 
-def infer_depth(net, img):
-    blob = cv2.dnn.blobFromImage(img, 1 / 255.0, (INSIZE, INSIZE), MEAN, swapRB=True, crop=False)
-    net.setInput(blob)
-    return np.squeeze(net.forward())          # (256,256) inverse depth, higher = closer
+class Cv2Depth:
+    """cv2.dnn CUDA backend (FP16 by default). Robust fallback — always available."""
+    name = "cv2.dnn"
+
+    def __init__(self):
+        net = cv2.dnn.readNetFromONNX(MODEL)
+        net.setPreferableBackend(cv2.dnn.DNN_BACKEND_CUDA)
+        if env("PERCEPTION_FP32", "0") == "1":
+            net.setPreferableTarget(cv2.dnn.DNN_TARGET_CUDA)
+            self.name = "cv2.dnn FP32"
+        else:
+            net.setPreferableTarget(cv2.dnn.DNN_TARGET_CUDA_FP16)
+            self.name = "cv2.dnn FP16"
+        self.net = net
+
+    def infer(self, img):
+        self.net.setInput(_blob(img))
+        return np.squeeze(self.net.forward())      # (256,256) inverse depth, higher = closer
+
+
+class TRTDepth:
+    """TensorRT FP16 engine backend (~6ms vs ~24ms for cv2.dnn FP16). Same preprocessing
+    and same (256,256) output. Raises on any setup problem so caller can fall back."""
+    name = "tensorrt FP16"
+
+    def __init__(self, engine_path):
+        import tensorrt as trt
+        import pycuda.driver as cuda
+        import pycuda.autoinit            # noqa: F401  (creates the CUDA context)
+        self._cuda = cuda
+        logger = trt.Logger(trt.Logger.ERROR)
+        with open(engine_path, "rb") as f, trt.Runtime(logger) as rt:
+            self.engine = rt.deserialize_cuda_engine(f.read())
+        if self.engine is None:
+            raise RuntimeError("failed to deserialize engine")
+        self.ctx = self.engine.create_execution_context()
+        self.bindings = []
+        self.inp = self.outp = None
+        for i in range(self.engine.num_bindings):
+            shape = tuple(self.engine.get_binding_shape(i))
+            dtype = trt.nptype(self.engine.get_binding_dtype(i))
+            host = cuda.pagelocked_empty(int(np.prod(shape)), dtype)
+            dev = cuda.mem_alloc(host.nbytes)
+            self.bindings.append(int(dev))
+            if self.engine.binding_is_input(i):
+                self.inp = (host, dev, shape)
+            else:
+                self.outp = (host, dev, shape)
+        if self.inp is None or self.outp is None:
+            raise RuntimeError("engine missing input/output binding")
+        self.stream = cuda.Stream()
+
+    def infer(self, img):
+        cuda = self._cuda
+        blob = _blob(img)                          # (1,3,256,256) float32, same as cv2 path
+        np.copyto(self.inp[0], blob.ravel())
+        cuda.memcpy_htod_async(self.inp[1], self.inp[0], self.stream)
+        self.ctx.execute_async_v2(self.bindings, self.stream.handle)
+        cuda.memcpy_dtoh_async(self.outp[0], self.outp[1], self.stream)
+        self.stream.synchronize()
+        return np.squeeze(self.outp[0].reshape(self.outp[2]))   # (256,256)
+
+
+def make_backend():
+    """Prefer the TensorRT engine; fall back to cv2.dnn if it's absent or won't load.
+    Set PERCEPTION_NO_TRT=1 to force the cv2.dnn path."""
+    if env("PERCEPTION_NO_TRT", "0") != "1" and os.path.exists(ENGINE):
+        try:
+            b = TRTDepth(ENGINE)
+            print("perception: depth backend = %s" % b.name, flush=True)
+            return b
+        except Exception as e:
+            print("perception: TRT engine load failed (%s) -> cv2.dnn fallback" % e, flush=True)
+    b = Cv2Depth()
+    print("perception: depth backend = %s" % b.name, flush=True)
+    return b
 
 
 def free_space(depth):
+    # a horizontal strip AHEAD of the car (excludes the near-floor at the wheels, which
+    # otherwise dominates and hides obstacles). In this band, obstacle -> higher (closer).
     h, w = depth.shape
-    band = depth[int(h * BAND_TOP):, :]
+    band = depth[int(h * BAND_TOP):int(h * BAND_BOT), :]
     l, c, r = np.array_split(band, 3, axis=1)
-    return [float(np.percentile(x, 95)) for x in (l, c, r)]
+    return [float(np.percentile(x, 90)) for x in (l, c, r)]
 
 
 def clearness(near):
@@ -149,10 +226,10 @@ def main():
         print("perception: FATAL — camera %d gave no frame (is another process holding it?)" % CAM_INDEX, flush=True)
         return
 
-    print("perception: loading MiDaS-small on CUDA...", flush=True)
+    print("perception: loading MiDaS-small depth backend...", flush=True)
     t0 = time.time()
-    net = load_net()
-    infer_depth(net, warm)                    # build CUDA graph (~6s one-time)
+    backend = make_backend()
+    backend.infer(warm)                       # warm up (build graph / first launch)
     print("perception: ready in %.1fs, cap %.0f fps" % (time.time() - t0, FPS_CAP), flush=True)
 
     tracker = None
@@ -162,6 +239,9 @@ def main():
     last_frame_write = 0.0
     ema_fps = 0.0
     miss = 0
+    loom_hist = []                            # (t, center_near) for looming detection
+    prev_small = None                         # downscaled gray of previous frame (scene-motion / stuck detection)
+    near_ema = None                           # smoothed per-column nearness (spike-robust for nav + advance)
 
     while _run:
         loop_t = time.time()
@@ -178,11 +258,30 @@ def main():
         miss = 0
         H, W = img.shape[:2]
 
-        depth = infer_depth(net, img)
+        # scene-motion: mean abs pixel change vs previous frame (downscaled gray).
+        # ~0 when the view is frozen -> the car isn't actually moving (wedged on something
+        # the depth band can't see). Consumed by nav.py for stuck detection.
+        small = cv2.cvtColor(cv2.resize(img, (96, 54)), cv2.COLOR_BGR2GRAY)
+        motion = float(np.mean(cv2.absdiff(small, prev_small))) if prev_small is not None else 0.0
+        prev_small = small
+
+        depth = backend.infer(img)
         near = free_space(depth)
+        # light per-column temporal smoothing: removes single-frame depth noise (so the
+        # advance stop-threshold can't trip on one bad frame) without lagging real changes.
+        if near_ema is None:
+            near_ema = list(near)
+        else:
+            near_ema = [NEAR_EMA * n + (1.0 - NEAR_EMA) * p for n, p in zip(near, near_ema)]
+        near = near_ema
         clr = clearness(near)
         clearest = "lcr"[int(np.argmax(clr))]
         blocked = near[1] >= STOP_NEAR
+        # looming: rise in center-ahead nearness over LOOM_WINDOW (positive = something approaching)
+        loom_hist.append((loop_t, near[1]))
+        while loom_hist and loop_t - loom_hist[0][0] > LOOM_WINDOW:
+            loom_hist.pop(0)
+        loom = round(near[1] - loom_hist[0][1], 1) if loom_hist else 0.0
 
         # ---- Stage 3 scaffold: target tracking (inert unless a goal seed exists) ----
         target = {"active": False, "bearing": 0.0, "size": 0.0, "lost": False}
@@ -218,7 +317,8 @@ def main():
             "ts": round(loop_t, 3), "fps": round(ema_fps, 1),
             "near": {"l": round(near[0]), "c": round(near[1]), "r": round(near[2])},
             "clear": {"l": clr[0], "c": clr[1], "r": clr[2]},
-            "clearest": clearest, "blocked": bool(blocked), "target": target,
+            "clearest": clearest, "blocked": bool(blocked), "loom": loom,
+            "motion": round(motion, 2), "target": target,
         }))
 
         # throttled frame.jpg for the voice sidecar (look/ambient)
@@ -234,8 +334,8 @@ def main():
             if target["active"]:
                 tg = " | target %s bearing=%+.2f size=%.3f" % (
                     "LOST" if target["lost"] else "ok", target["bearing"], target["size"])
-            print("%.1ffps near L/C/R=%4d/%4d/%4d clearest=%s%s%s"
-                  % (ema_fps, near[0], near[1], near[2], clearest,
+            print("%.1ffps near L/C/R=%4d/%4d/%4d clearest=%s motion=%.1f%s%s"
+                  % (ema_fps, near[0], near[1], near[2], clearest, motion,
                      " [BLOCKED]" if blocked else "", tg), flush=True)
 
         if period:
