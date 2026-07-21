@@ -78,12 +78,12 @@ INSTRUCTIONS = (
     "moves; short bursts followed by re-checking are safe. Call the look tool only when the user asks "
     "what you see, or when you are about to drive toward a specific target and need a crisp view to aim "
     "or confirm the path is clear. "
-    "SEARCHING: when told to turn or move until you see something, do NOT tap in tiny increments. "
-    "Start a CONTINUOUS turn at a steady moderate speed (call drive with the full duration and keep "
-    "re-issuing it so the motion never pauses) and watch the ambient camera snapshots as it sweeps. "
-    "Driving is non-blocking, so you stay fully aware while moving. The INSTANT the target first edges "
-    "into frame, call stop immediately (stop preempts the turn). Turning smoothly and stopping on sight "
-    "is what makes the reaction fast; stop-and-recheck tapping is slow and defeats the point."
+    "SEARCHING: when told to turn or move until you see something, do NOT tap in tiny increments and "
+    "do NOT spin fast. Start a CONTINUOUS but SLOW turn (speed about 0.3 — this overrides the full-speed "
+    "default) and keep re-issuing it so the motion never pauses, watching the ambient snapshots as it "
+    "sweeps. Driving is non-blocking, so you stay aware while moving. There is ~1-2 s of reaction lag, so "
+    "a fast spin overshoots far past the target before you can react; a slow spin keeps the overshoot "
+    "small. Call stop the INSTANT the target first edges into frame (stop preempts the turn)."
 )
 
 TOOLS = [
