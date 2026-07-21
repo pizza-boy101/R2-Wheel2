@@ -69,8 +69,9 @@ os.environ.setdefault("XDG_RUNTIME_DIR", "/run/user/%d" % os.getuid())
 INSTRUCTIONS = (
     "You are the voice of a small four-wheeled robot car with a forward camera. "
     "Keep spoken replies short and natural. To move, call the drive tool with a direction, "
-    "a speed from 0 to 1, and a short duration in seconds — prefer brief bursts (0.5 to 1.5 s) "
-    "and re-check rather than long blind drives. Call stop the instant the user says stop. "
+    "a speed from 0 to 1 (default to FULL speed, 1.0, unless the user asks to go slower), and a "
+    "short duration in seconds — prefer brief bursts (0.5 to 1.5 s) and re-check rather than long "
+    "blind drives. Call stop the instant the user says stop. "
     "VISION: you receive ambient camera snapshots automatically whenever the view changes, so you "
     "are already aware of the scene most of the time — treat those as background awareness and only "
     "mention them if something important appears (e.g. an obstacle). Do NOT call look before ordinary "
@@ -91,7 +92,7 @@ TOOLS = [
      "parameters": {"type": "object", "properties": {
          "direction": {"type": "string", "enum": ["forward", "back", "left", "right", "cw", "ccw"],
                        "description": "forward/back, left/right = strafe, cw/ccw = rotate in place"},
-         "speed": {"type": "number", "description": "0..1, default 0.9"},
+         "speed": {"type": "number", "description": "0..1, default 1 (full speed)"},
          "seconds": {"type": "number", "description": "burst length, keep <= 2"}},
          "required": ["direction"]}},
     {"type": "function", "name": "stop",
@@ -175,7 +176,7 @@ def invoke_tool(name, args_json):
     try:
         if name == "drive":
             d = args.get("direction", "forward")
-            spd = _clamp(args.get("speed", 0.9), 0.0, 1.0, 0.9)
+            spd = _clamp(args.get("speed", 1.0), 0.0, 1.0, 1.0)
             secs = _clamp(args.get("seconds", 1.0), 0.1, 2.0, 1.0)
             _kill_motion()   # a new command preempts any in-flight turn
             # non-blocking: the move script keeps resending for `secs` in the background,

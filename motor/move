@@ -6,7 +6,7 @@ WS="$(cd "$(dirname "$0")" && pwd)"
 DISARM="$WS/.disarmed"
 [ -n "$PORT" ] || { echo "no serial port found" >&2; exit 1; }
 stty -F "$PORT" 115200 cs8 -cstopb -parenb raw -hupcl -echo 2>/dev/null
-cmd="$1"; spd="${2:-0.9}"; secs="$3"
+cmd="$1"; spd="${2:-1.0}"; secs="$3"
 
 # --- kill switch ---
 case "$cmd" in
