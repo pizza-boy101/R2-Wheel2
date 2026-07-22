@@ -1,25 +1,52 @@
 #!/bin/sh
-# move — send a drive command to the robot's Arduino over USB serial.
+# move — send a drive command to the robot. Prefers the persistent motor daemon (the
+# single owner of the serial link) via its unix socket; falls back to writing the serial
+# port directly if the daemon isn't running. Kill switch = the .disarmed flag, honored
+# on both paths.
 # usage: move <forward|back|left|right|cw|ccw|stop|raw|arm|disarm> [speed 0..1] [seconds]
-PORT="${ROBOT_SERIAL:-$(ls /dev/ttyUSB* /dev/ttyACM* 2>/dev/null | head -n1)}"
 WS="$(cd "$(dirname "$0")" && pwd)"
+RD="$(cd "$WS/.." && pwd)"
 DISARM="$WS/.disarmed"
-[ -n "$PORT" ] || { echo "no serial port found" >&2; exit 1; }
-stty -F "$PORT" 115200 cs8 -cstopb -parenb raw -hupcl -echo 2>/dev/null
+SOCK="$WS/motor.sock"
+SEND="$RD/motor_send.py"
 cmd="$1"; spd="${2:-1.0}"; secs="$3"
 
-# --- kill switch ---
+daemon_up() { [ -S "$SOCK" ]; }
+send() { python3 "$SEND" "$@" 2>/dev/null; }
+
+# --- kill switch (flag-based; enforced by whichever path is active) ---
 case "$cmd" in
-  disarm|kill) printf '%s\n' "S" > "$PORT" 2>/dev/null; : > "$DISARM"; echo "DISARMED — motion blocked until 'move arm'"; exit 0 ;;
-  arm|resume)  rm -f "$DISARM"; echo "ARMED — motion allowed"; exit 0 ;;
+  disarm|kill)
+    : > "$DISARM"
+    if daemon_up; then
+      send "stop"
+    else
+      PORT="${ROBOT_SERIAL:-$(ls /dev/ttyUSB* /dev/ttyACM* 2>/dev/null | head -n1)}"
+      [ -n "$PORT" ] && { stty -F "$PORT" 115200 raw -echo 2>/dev/null; printf '%s\n' "S" > "$PORT"; }
+    fi
+    echo "DISARMED — motion blocked until 'move arm'"; exit 0 ;;
+  arm|resume) rm -f "$DISARM"; echo "ARMED — motion allowed"; exit 0 ;;
 esac
-# while disarmed, refuse all motion (stop is always allowed)
+
+# --- daemon present: route everything through it (single serial owner) ---
+if daemon_up; then
+  case "$cmd" in
+    forward|back|left|right|cw|ccw) send "$cmd $spd $secs"; exit 0 ;;
+    stop|"")                        send "stop"; exit 0 ;;
+    raw)                            send "raw $2"; exit 0 ;;
+    *) echo "usage: move <forward|back|left|right|cw|ccw|stop|raw|arm|disarm> [speed] [seconds]" >&2; exit 2 ;;
+  esac
+fi
+
+# --- fallback: no daemon -> drive the serial directly (original behavior) ---
+PORT="${ROBOT_SERIAL:-$(ls /dev/ttyUSB* /dev/ttyACM* 2>/dev/null | head -n1)}"
+[ -n "$PORT" ] || { echo "no serial port found" >&2; exit 1; }
+stty -F "$PORT" 115200 cs8 -cstopb -parenb raw -hupcl -echo 2>/dev/null
 if [ -f "$DISARM" ] && [ -n "$cmd" ] && [ "$cmd" != "stop" ]; then
   printf '%s\n' "S" > "$PORT"
   echo "DISARMED — motion blocked (kill switch engaged; run: ./move arm)" >&2
   exit 3
 fi
-
 case "$cmd" in
   forward) V="V 0 $spd 0" ;;
   back)    V="V 0 -$spd 0" ;;
