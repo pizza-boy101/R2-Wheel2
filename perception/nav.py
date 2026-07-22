@@ -28,7 +28,10 @@ import os
 import json
 import time
 import signal
-import subprocess
+import socket
+
+import avoid                      # shared avoidance brain (decide + recovery_plan); see avoid.py
+from avoid import decide          # re-exported so `nav.decide` still resolves for callers/tests
 
 HOME = os.path.expanduser("~")
 
@@ -44,31 +47,24 @@ STATE = os.path.join(WORKSPACE, "nav_state.json")
 MODE = os.path.join(WORKSPACE, "nav_mode")
 DISARM = os.path.join(WORKSPACE, ".disarmed")
 
-STOP_NEAR = float(env("STOP_NEAR", "1100"))
+# decide()/recovery thresholds now live in avoid.py (single source of truth, shared with the
+# API control path). Alias the ones nav's own logging/loop references so those lines are unchanged.
+STOP_NEAR = avoid.STOP_NEAR
+SIDE_NEAR = avoid.SIDE_NEAR
+LOOM_BRAKE = avoid.LOOM_BRAKE
+TURN_SPEED = avoid.TURN_SPEED
+
 FWD_SPEED = float(env("NAV_FWD_SPEED", "1.0"))
-TURN_SPEED = float(env("NAV_TURN_SPEED", "1.0"))
 BURST = float(env("NAV_BURST", "0.6"))          # move duration per command (re-issued to sustain)
-LOOP_HZ = float(env("NAV_LOOP_HZ", "10"))
+LOOP_HZ = float(env("NAV_LOOP_HZ", "20"))       # 20Hz: halves the decide->act latency vs 10 (reads are cheap)
 STATE_STALE = float(env("NAV_STATE_STALE", "0.7"))
 
-# --- stuck detection: commanded to move but the camera view isn't changing -> wedged on
-# something the depth band can't see. Back up and turn to free ourselves. ---
+# --- stuck detection (nav-local): commanded to move but the camera view isn't changing -> wedged
+# on something the depth band can't see. recover() (via avoid.recovery_plan) frees us. ---
 MOTION_MIN = float(env("NAV_MOTION_MIN", "5.0"))     # smoothed scene-change below this = not actually moving
                                                      # (calibrated: static ~1.5, moving ~12)
 STUCK_SECS = float(env("NAV_STUCK_SECS", "1.3"))     # low motion for this long while driving = stuck
-BACK_SECS = float(env("NAV_BACK_SECS", "0.5"))       # reverse duration during recovery
-RECOVER_TURN_SECS = float(env("NAV_RECOVER_TURN_SECS", "0.7"))
-BACK_SPEED = float(env("NAV_BACK_SPEED", "0.7"))
 MAX_STUCK = int(env("NAV_MAX_STUCK", "4"))           # give up (park) after this many failed recoveries in a row
-
-# --- B4 steering quality (turn hysteresis + side-column brake + loom brake). Thresholds
-# below are sensible starting points but MUST be tuned on the floor with motion. ---
-SIDE_NEAR = float(env("NAV_SIDE_NEAR", "900"))       # a side column this close blocks forward (corner-clip guard).
-                                                     # Deliberately high so parallel corridor walls don't paralyze it.
-LOOM_BRAKE = float(env("NAV_LOOM_BRAKE", "120"))     # rapid approach -> brake even if absolute nearness is under STOP_NEAR
-RESUME_NEAR = float(env("NAV_RESUME_NEAR", str(STOP_NEAR - 80)))   # hysteresis: resume forward only once clearly clear
-TURN_COMMIT_SECS = float(env("NAV_TURN_COMMIT", "0.7"))           # hold a chosen turn direction at least this long (anti-dither)
-TURN_SWITCH_MARGIN = float(env("NAV_TURN_SWITCH_MARGIN", "120"))  # only flip turn direction if the other side is clearer by this much
 
 _run = True
 
@@ -78,52 +74,33 @@ def _stop(*_):
     _run = False
 
 
-_motion = None
+# ---- motor commands go to the persistent motor daemon over its unix socket ----
+# (no per-command process spawn; the daemon owns the serial, sustains motion via its
+#  own watchdog resend, and enforces the .disarmed kill switch. If the daemon is down,
+#  sends silently no-op -> the car stays still, which is the safe failure.)
+MOTOR_SOCK = os.path.join(WORKSPACE, "motor.sock")
+_msock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
 
 
-def _kill_motion():
-    global _motion
-    if _motion is not None and _motion.poll() is None:
-        try:
-            _motion.terminate()
-        except Exception:
-            pass
-    _motion = None
-
-
-def drive(direction, speed, secs):
-    """Non-blocking: move resends in the background so the loop stays free to react."""
-    global _motion
-    _kill_motion()
-    _motion = subprocess.Popen([MOVE, direction, "%.2f" % speed, "%.2f" % secs],
-                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-
-
-def stop_motors():
-    _kill_motion()
-    subprocess.run([MOVE, "stop"], capture_output=True, timeout=5)
-
-
-def _drive_blocking(direction, speed, secs):
-    """Run a timed maneuver to completion (move exits after `secs`). Honors the kill
-    switch mid-move (the move script checks .disarmed each tick)."""
-    _kill_motion()
+def motor(cmd):
     try:
-        subprocess.run([MOVE, direction, "%.2f" % speed, "%.2f" % secs],
-                       capture_output=True, timeout=secs + 3)
+        _msock.sendto(cmd.encode(), MOTOR_SOCK)
     except Exception:
         pass
 
 
+def stop_motors():
+    motor("stop")
+
+
 def recover(state):
-    """Free a wedged car: reverse a little, then rotate toward the more-open side."""
-    _drive_blocking("back", BACK_SPEED, BACK_SECS)
-    d = "cw"
-    if state:
-        n = state["near"]
-        d = "ccw" if n["l"] <= n["r"] else "cw"   # spin toward whichever side reads more open
-    _drive_blocking(d, TURN_SPEED, RECOVER_TURN_SECS)
-    stop_motors()
+    """Free a wedged car via avoid.recovery_plan (reverse, then rotate toward the open
+    side). Timed daemon moves self-expire, so the blocking sleeps here don't trip the
+    daemon dead-man."""
+    for cmd, spd, secs in avoid.recovery_plan(state):
+        motor("%s %.2f %.2f" % (cmd, spd, secs))
+        time.sleep(secs + 0.05)
+    motor("stop")
 
 
 def read_mode():
@@ -145,43 +122,11 @@ def read_state():
         return None
 
 
-def decide(l, c, r, loom, cur_act, turn_started, now):
-    """Choose forward/cw/ccw. Beyond the naive 'forward if center clear', B4 adds:
-      - side-column braking: a very close L or R also blocks forward (corner-clip guard),
-      - loom early-brake: a fast rise in nearness blocks forward before it's even close,
-      - turn hysteresis: once turning, commit to that direction for TURN_COMMIT_SECS and
-        only switch if the other side is clearer by TURN_SWITCH_MARGIN, and resume forward
-        only once genuinely clear (RESUME_NEAR) — kills the cw/ccw dither when L~R.
-    Returns (act, turn_started)."""
-    side_block = (l >= SIDE_NEAR) or (r >= SIDE_NEAR)
-    blocked = (c >= STOP_NEAR) or side_block or (loom >= LOOM_BRAKE)
-    turning = cur_act in ("cw", "ccw")
-
-    if not blocked:
-        if turning:
-            # coast through the hysteresis band still turning; resume forward only when clearly clear
-            if c < RESUME_NEAR and l < SIDE_NEAR and r < SIDE_NEAR and loom < LOOM_BRAKE:
-                return "forward", 0.0
-            return cur_act, turn_started
-        return "forward", 0.0
-
-    # blocked -> turn toward the more-open side (lower nearness), with hysteresis
-    want = "ccw" if l <= r else "cw"
-    if turning:
-        if (now - turn_started) < TURN_COMMIT_SECS:
-            return cur_act, turn_started               # commit: no mid-turn flip
-        if want != cur_act and abs(l - r) >= TURN_SWITCH_MARGIN:
-            return want, now                           # other side clearly better -> switch
-        return cur_act, turn_started
-    return want, now                                   # start a new turn
-
-
 def main():
     signal.signal(signal.SIGTERM, _stop)
     signal.signal(signal.SIGINT, _stop)
     period = 1.0 / LOOP_HZ
-    cur = None                                # current action, so we only re-issue on change/expiry
-    cur_started = 0.0
+    cur = None                                # current action (None = stopped/idle), for stuck logic + logging
     last_log = 0.0
     low_since = None                          # when smoothed motion first dropped below MOTION_MIN while driving
     last_recover = 0.0                        # cooldown so we don't re-trigger during/right after a recovery
@@ -221,9 +166,9 @@ def main():
 
         now = time.time()
         act, turn_started = decide(l, c, r, loom, cur, turn_started, now)  # B4: hysteresis + side/loom brake
-        if act != cur or (now - cur_started) > BURST * 0.6:               # (re)issue on change or before expiry
-            drive(act, FWD_SPEED if act == "forward" else TURN_SPEED, BURST)
-            cur, cur_started = act, now
+        spd = FWD_SPEED if act == "forward" else TURN_SPEED
+        motor("%s %.2f" % (act, spd))          # send every loop; the daemon sustains it and
+        cur = act                              # dead-mans if we ever stop sending (e.g. nav dies)
 
         # --- stuck detection: commanding motion but the view isn't changing -> wedged ---
         stuck = False
