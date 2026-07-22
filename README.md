@@ -29,6 +29,11 @@ robot reads the depth about twenty times a second and picks a move: go straight 
 ahead is clear, and turn toward the more open side when something gets close. So you can point
 it at a cluttered bit of floor and it threads through instead of stopping dead or crashing.
 
+It can hunt for things. Ask it to find something and it turns in small steps, taking a photo
+at each one, until the thing is clearly in view — then it can head over to it, checking again
+as it goes so it doesn't drift off. It isn't great at recognising things from across a room
+yet, but it looks around and works toward them instead of giving up after one glance.
+
 It tries not to hurt itself or me. One program owns the link to the motors and keeps
 re-sending the current command faster than the firmware's timeout, so motion stays smooth;
 if that program dies or you hit the kill switch, everything stops within a fraction of a
@@ -116,8 +121,10 @@ that work to a background thread fixed it.
 Debugging a headless robot over SSH by squinting at log files got old fast, so I wrote a tiny
 web dashboard (debug/debug_web.py) that I open in a browser on my laptop. It shows the live
 camera frame, the left/middle/right closeness bars, whether it's armed, and a running tail of
-each log, plus an arm/disarm button and an escape-key kill switch. It's read-only apart from
-that switch, and it's plain Python with no extra dependencies, so it just runs.
+each log, plus an arm/disarm button and an escape-key kill switch. There's also a little chat
+box on the page: I can type to the robot when saying things out loud isn't practical, and its
+replies show up there. Apart from the switch and the chat it's read-only, and it's plain
+Python with no extra dependencies, so it just runs.
 
 ## Stuff that went wrong
 
@@ -166,8 +173,9 @@ any API keys are deliberately not in this repo (see .gitignore), so you bring yo
 
 ## What I want to add next
 
-- "Go to the doorway", where the voice AI picks a target and the robot navigates to it, rather
-  than just avoiding things in front of it.
+- Make going to a specific thing rock solid. It can already search for something and head
+  toward it, but it loses track of the target on the way and has to keep re-checking; a proper
+  object tracker (or a depth camera) would let it lock on and go straight there.
 - Get a proper depth camera or a range sensor so the distances are real measurements instead
   of estimates, especially for the see-through and thin things a plain camera struggles with.
 - Try building a simple map of a room so it can remember where things are instead of only
