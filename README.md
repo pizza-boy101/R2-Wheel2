@@ -68,6 +68,8 @@ the hard way (more on that below).
   loop and the voice
 - perception/depth_bench.py: a quick benchmark I wrote to check the GPU was fast enough
 - voice/realtime_sidecar.py: the talk to it voice loop
+- debug/debug_web.py: a little web dashboard I open in a browser to watch what it's doing
+- debug/run.sh: starts that dashboard
 
 ## How it works
 
@@ -109,6 +111,14 @@ want opposite things when there's a wall in front. One bug that took me a while:
 the image processing on the same thread as the audio, and it made the voice stutter. Moving
 that work to a background thread fixed it.
 
+## Watching it
+
+Debugging a headless robot over SSH by squinting at log files got old fast, so I wrote a tiny
+web dashboard (debug/debug_web.py) that I open in a browser on my laptop. It shows the live
+camera frame, the left/middle/right closeness bars, whether it's armed, and a running tail of
+each log, plus an arm/disarm button and an escape-key kill switch. It's read-only apart from
+that switch, and it's plain Python with no extra dependencies, so it just runs.
+
 ## Stuff that went wrong
 
 I killed two ESP32 boards before switching to the Arduino compatible one. The first board's
@@ -146,6 +156,9 @@ python3 perception/nav.py
 
 # start the voice loop (needs an OpenAI API key, kept out of the repo)
 OPENAI_KEY_FILE=~/secrets/openai.key python3 voice/realtime_sidecar.py
+
+# start the debug dashboard (optional; then open http://<jetson-ip>:8099 in a browser)
+./debug/run.sh
 ```
 
 You'll need OpenCV built with CUDA, NumPy, websockets, and PulseAudio. The depth model and
