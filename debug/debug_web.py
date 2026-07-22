@@ -5,14 +5,17 @@ Serves a live view (open http://<jetson-ip>:8099 in a browser):
   - the camera frame (frame.jpg),
   - live nav_state (per-column nearness bars, clearest, loom, motion, target),
   - armed/disarmed + nav mode,
-  - streaming tails of the voice / nav / motor / perception logs.
-The one control it exposes is the ARM/DISARM kill switch: POST /disarm creates the
-`.disarmed` file, POST /arm removes it, and the motor daemon enforces it every loop.
+  - streaming tails of the voice / nav / motor / perception logs,
+  - a text chat to the bot (for when talking to it isn't practical).
+Controls it exposes: the ARM/DISARM kill switch (POST /disarm creates the `.disarmed`
+file, POST /arm removes it; the motor daemon enforces it every loop), and POST /chat,
+which forwards a typed message to the voice sidecar's live session over a unix socket.
 It still never drives the motors directly. DISARM is one-tap (safe direction) and Esc
 is an emergency stop; ARM asks for confirmation first. Stdlib only (http.server)."""
 import os
 import json
 import time
+import socket
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
@@ -28,6 +31,8 @@ LOGS = {"voice": os.path.join(ROBOT, "realtime.log"),
         "motor": os.path.join(ROBOT, "motor.log"),
         "perception": os.path.join(ROBOT, "perception.log")}
 PORT = int(os.environ.get("DEBUG_WEB_PORT", "8099"))
+CHAT_SOCK = os.path.join(WORKSPACE, "chat.sock")   # typed messages -> voice sidecar's live session
+_chatsock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
 
 PAGE = """<!doctype html><html><head><meta charset=utf-8>
 <meta name=viewport content="width=device-width,initial-scale=1">
@@ -61,6 +66,14 @@ img{width:100%;border-radius:6px;display:block;background:#000}
 .tab.on{background:#1f6feb;border-color:#1f6feb;color:#fff}
 pre{background:#010409;border:1px solid #30363d;border-radius:6px;padding:8px;height:340px;overflow:auto;margin:0;white-space:pre-wrap;word-break:break-word;font-size:12px}
 .blk{color:#ff9a9a}.fwd{color:#7ee2a8}
+.chatlog{height:220px;overflow:auto;display:flex;flex-direction:column;gap:6px;margin-bottom:8px;padding:8px;background:#010409;border:1px solid #30363d;border-radius:6px}
+.msg{max-width:85%;padding:5px 9px;border-radius:10px;white-space:pre-wrap;word-break:break-word}
+.msg.you{align-self:flex-end;background:#1f6feb;color:#fff;border-bottom-right-radius:3px}
+.msg.car{align-self:flex-start;background:#21262d;color:#c9d1d9;border-bottom-left-radius:3px}
+.msg.sys{align-self:center;background:transparent;color:#6e7681;font-size:11px}
+#chatform{display:flex;gap:6px}
+#chatinput{flex:1;background:#0d1117;border:1px solid #30363d;border-radius:6px;color:#c9d1d9;padding:7px 9px;font:inherit}
+#chatform button{background:#238636;border:none;border-radius:6px;color:#fff;padding:7px 16px;cursor:pointer;font:inherit;font-weight:700}
 </style></head><body>
 <header>
   <h1>robocar debug</h1>
@@ -91,6 +104,13 @@ pre{background:#010409;border:1px solid #30363d;border-radius:6px;padding:8px;he
         <b>target</b><span id=target>–</span>
         <b>stop_near</b><span>680</span>
       </div>
+    </div>
+    <div class=card><h2>chat (type to the bot)</h2>
+      <div id=chatlog class=chatlog></div>
+      <form id=chatform>
+        <input id=chatinput autocomplete=off placeholder="type a message to the bot…">
+        <button type=submit>send</button>
+      </form>
     </div>
   </div>
 </div>
@@ -149,8 +169,55 @@ function poll(){
 }
 setInterval(poll,300);setInterval(tail,500);
 setInterval(function(){document.getElementById("cam").src="/frame.jpg?t="+Date.now();},300);
-poll();tail();
+// ---- chat: type to the bot; replies (its spoken transcript) show here too ----
+var chatLogEl=document.getElementById("chatlog"), chatBottom=true;
+chatLogEl.addEventListener("scroll",function(){chatBottom=chatLogEl.scrollHeight-chatLogEl.scrollTop-chatLogEl.clientHeight<40;});
+function renderChat(turns){
+  chatLogEl.innerHTML="";
+  turns.forEach(function(t){var d=document.createElement("div");d.className="msg "+(t.who==="you"?"you":"car");d.textContent=t.text;chatLogEl.appendChild(d);});
+  if(chatBottom)chatLogEl.scrollTop=chatLogEl.scrollHeight;
+}
+function pollChat(){fetch("/chatlog").then(r=>r.json()).then(function(d){if(d.turns)renderChat(d.turns);}).catch(function(){});}
+document.getElementById("chatform").addEventListener("submit",function(e){
+  e.preventDefault();
+  var inp=document.getElementById("chatinput"),text=inp.value.trim();if(!text)return;inp.value="";
+  fetch("/chat",{method:"POST",headers:{"Content-Type":"text/plain"},body:text}).then(r=>r.json()).then(function(d){
+    if(!d.ok){var s=document.createElement("div");s.className="msg sys";s.textContent="couldn't reach the voice service — is it running?";chatLogEl.appendChild(s);chatLogEl.scrollTop=chatLogEl.scrollHeight;}
+    setTimeout(pollChat,300);
+  }).catch(function(){});
+});
+setInterval(pollChat,1200);
+poll();tail();pollChat();
 </script></body></html>"""
+
+
+def parse_chat(path, limit=40, tailbytes=16384):
+    """Pull the recent You/Car turns out of the voice log for the chat pane. Reads only the
+    tail (the log can be large) and dedups adjacent identical lines (the logger writes each
+    line twice: once to the file, once to stdout which systemd also appends here)."""
+    turns = []
+    try:
+        size = os.path.getsize(path)
+        with open(path, "r", errors="replace") as f:
+            if size > tailbytes:
+                f.seek(size - tailbytes)
+                f.readline()                        # drop the partial first line
+            lines = f.readlines()
+    except Exception:
+        return turns
+    for ln in lines:
+        for tag, who in (("You (chat): ", "you"), ("You: ", "you"), ("Car: ", "car")):
+            i = ln.find(tag)
+            if i != -1:
+                text = ln[i + len(tag):].strip()
+                if text:
+                    turns.append({"who": who, "text": text})
+                break
+    out = []
+    for t in turns:
+        if not out or out[-1] != t:                 # collapse the double-logged duplicates
+            out.append(t)
+    return out[-limit:]
 
 
 class H(BaseHTTPRequestHandler):
@@ -203,6 +270,9 @@ class H(BaseHTTPRequestHandler):
                         data = f.read(65536)
                         pos = f.tell()
                 self._send(200, "application/json", json.dumps({"pos": pos, "data": data}).encode())
+            elif u.path == "/chatlog":
+                self._send(200, "application/json",
+                           json.dumps({"turns": parse_chat(LOGS["voice"])}).encode())
             else:
                 self._send(404, "text/plain", b"not found")
         except Exception as e:
@@ -215,8 +285,7 @@ class H(BaseHTTPRequestHandler):
         u = urlparse(self.path)
         try:
             ln = int(self.headers.get("Content-Length") or 0)
-            if ln:
-                self.rfile.read(ln)                 # drain body so keep-alive stays sane
+            body = self.rfile.read(ln) if ln else b""   # read body (also drains it for keep-alive)
             if u.path == "/disarm":
                 open(DISARM, "w").close()           # create kill switch -> daemon stops within a loop
                 self._send(200, "application/json", json.dumps({"disarmed": True}).encode())
@@ -226,6 +295,16 @@ class H(BaseHTTPRequestHandler):
                 except FileNotFoundError:
                     pass
                 self._send(200, "application/json", json.dumps({"disarmed": os.path.exists(DISARM)}).encode())
+            elif u.path == "/chat":
+                text = body.decode("utf-8", "ignore").strip()
+                ok = False
+                if text:
+                    try:
+                        _chatsock.sendto(text.encode("utf-8"), CHAT_SOCK)   # -> voice sidecar's session
+                        ok = True
+                    except Exception:
+                        ok = False                  # sidecar not running / socket absent
+                self._send(200, "application/json", json.dumps({"ok": ok}).encode())
             else:
                 self._send(404, "text/plain", b"not found")
         except Exception as e:
