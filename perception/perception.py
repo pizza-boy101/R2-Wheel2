@@ -21,6 +21,11 @@ Output -> workspace/nav_state.json (atomic):
     "clear": {"l","c","r"},   # 0..1 relative clearness within the frame (1 = clearest)
     "clearest": "l|c|r",
     "blocked": bool,          # center nearer than STOP_NEAR (advisory until calibrated)
+    "loom":  float,           # depth-based: rise in center nearness over LOOM_WINDOW (+ = approaching)
+    "flow":  float,           # flow-based: outward radial flow px/frame in center band (+ = approaching)
+    "exp":   float,           # flow-based: per-frame fractional expansion (~1/TTC_frames)
+    "ttc":   float,           # est. seconds-to-contact from expansion (99 = clear / not moving)
+    "motion": float,          # mean abs pixel change vs prev frame (0 = view frozen -> stuck)
     "target": {"active","bearing","size","lost"}   # Stage 3 tracker; inert until a goal seed exists
   }
 Also writes workspace/frame.jpg (throttled) for the voice sidecar.
@@ -70,6 +75,15 @@ BAND_BOT = float(env("PERCEPTION_BAND_BOT", "0.62"))
 LOOM_WINDOW = float(env("PERCEPTION_LOOM_WINDOW", "0.35"))  # s; loom = rise in center nearness over this window
 NEAR_EMA = float(env("PERCEPTION_NEAR_EMA", "0.6"))        # per-column smoothing weight on the new sample
                                                           # (1.0 = off; ~0.6 kills single-frame noise, ~1 frame lag)
+FLOW_ON = env("PERCEPTION_FLOW", "1") == "1"              # optical-flow expansion (looming) detector; scale-free,
+                                                          # complements MiDaS + catches transparent obstacles
+FLOW_W = int(env("PERCEPTION_FLOW_W", "128"))            # flow works on a small gray (cheap, less noise than full res)
+FLOW_H = int(env("PERCEPTION_FLOW_H", "72"))
+FLOW_DEADZONE = float(env("PERCEPTION_FLOW_DEADZONE", "0.12"))   # drop the singular focus-of-expansion center
+FLOW_WINDOW = float(env("PERCEPTION_FLOW_WINDOW", "0.6"))   # s; average expansion over this window. Per-frame flow
+                                                           # is symmetric noise with a small +bias when approaching;
+                                                           # only the windowed MEAN separates approach from noise.
+FLOW_RATE_MIN = float(env("PERCEPTION_FLOW_RATE_MIN", "0.004"))  # windowed expansion below this = noise -> ttc clear
 
 _run = True
 
@@ -186,6 +200,54 @@ def clearness(near):
     return [round(1.0 - (n - lo) / span, 3) for n in near]
 
 
+class FlowLoom:
+    """Optical-flow expansion (looming) detector — a second, depth-independent way to sense
+    "I'm about to hit something." As the car moves toward a surface the image expands, so
+    dense flow radiates outward from the focus of expansion (roughly the heading). We measure
+    the mean OUTWARD RADIAL flow in the center-ahead band:
+      - pure sideways translation / yaw cancels (left pixels flow one way, right the other),
+      - genuine approach shows up as net positive radial flow everywhere,
+      - it needs no absolute scale, and it fires on TRANSPARENT obstacles because it tracks
+        their visible contents/edges/label, not the (see-through) depth.
+
+    Publishes each update():
+      flow : median outward radial flow (px/frame) in the band; >0 = approaching, <0 = receding
+      rate : per-frame fractional expansion (radial_flow / radial_distance) ~= 1/TTC_frames,
+             which nav converts to a time-to-contact using the live fps.
+    Only meaningful while the car is moving; ~0 when parked (no parallax)."""
+
+    def __init__(self, w, h, band_top, band_bot, col_lo=0.20, col_hi=0.80, deadzone=0.12):
+        self.w, self.h = w, h
+        self.r0, self.r1 = int(h * band_top), int(h * band_bot)
+        self.c0, self.c1 = int(w * col_lo), int(w * col_hi)
+        cx, cy = w / 2.0, h / 2.0
+        ys, xs = np.mgrid[self.r0:self.r1, self.c0:self.c1].astype(np.float32)
+        dx, dy = xs - cx, ys - cy
+        dist = np.sqrt(dx * dx + dy * dy)
+        maxr = np.sqrt(cx * cx + cy * cy)
+        self.mask = dist > (deadzone * maxr)          # exclude the singular center (FOE)
+        safe = np.where(self.mask, dist, 1.0)
+        self.ux, self.uy = dx / safe, dy / safe       # unit outward-radial directions
+        self.rdist = dist[self.mask]                  # radial distance of the kept pixels
+        self.prev = None
+
+    def update(self, img_bgr):
+        g = cv2.cvtColor(cv2.resize(img_bgr, (self.w, self.h)), cv2.COLOR_BGR2GRAY)
+        if self.prev is None:
+            self.prev = g
+            return 0.0, 0.0
+        flow = cv2.calcOpticalFlowFarneback(self.prev, g, None, 0.5, 2, 13, 2, 5, 1.1, 0)
+        self.prev = g
+        u = flow[self.r0:self.r1, self.c0:self.c1, 0]
+        v = flow[self.r0:self.r1, self.c0:self.c1, 1]
+        radial = (u * self.ux + v * self.uy)[self.mask]      # +ve = outward (expanding)
+        if radial.size == 0:
+            return 0.0, 0.0
+        flow_px = float(np.median(radial))                    # px/frame outward
+        exp_rate = float(np.median(radial / self.rdist))      # fractional expansion / frame
+        return flow_px, exp_rate
+
+
 def make_tracker():
     for ctor in ("legacy.TrackerCSRT_create", "TrackerCSRT_create",
                  "legacy.TrackerKCF_create", "TrackerKCF_create"):
@@ -232,12 +294,21 @@ def main():
     backend.infer(warm)                       # warm up (build graph / first launch)
     print("perception: ready in %.1fs, cap %.0f fps" % (time.time() - t0, FPS_CAP), flush=True)
 
+    flow_det = None
+    if FLOW_ON:
+        flow_det = FlowLoom(FLOW_W, FLOW_H, BAND_TOP, BAND_BOT, deadzone=FLOW_DEADZONE)
+        print("perception: optical-flow looming ON (%dx%d)" % (FLOW_W, FLOW_H), flush=True)
+
     tracker = None
     tracked_seed = None
     period = 1.0 / FPS_CAP if FPS_CAP > 0 else 0.0
     last_log = 0.0
     last_frame_write = 0.0
     ema_fps = 0.0
+    read_ema = 0.0                            # camera read() time (high => buffer lag / camera-bound)
+    infer_ema = 0.0                           # depth inference time
+    flow_ema = 0.0                            # optical-flow compute time
+    exp_hist = []                             # (t, expansion_rate) over FLOW_WINDOW — windowed mean beats raw jitter
     miss = 0
     loom_hist = []                            # (t, center_near) for looming detection
     prev_small = None                         # downscaled gray of previous frame (scene-motion / stuck detection)
@@ -256,6 +327,8 @@ def main():
             time.sleep(0.03)
             continue
         miss = 0
+        read_ms = (time.time() - loop_t) * 1000.0
+        read_ema = read_ms if read_ema == 0 else 0.9 * read_ema + 0.1 * read_ms
         H, W = img.shape[:2]
 
         # scene-motion: mean abs pixel change vs previous frame (downscaled gray).
@@ -265,7 +338,21 @@ def main():
         motion = float(np.mean(cv2.absdiff(small, prev_small))) if prev_small is not None else 0.0
         prev_small = small
 
+        # optical-flow expansion (looming) — depth-independent approach detector (see FlowLoom)
+        flow_px, exp_rate = 0.0, 0.0
+        if flow_det is not None:
+            t_fl = time.time()
+            flow_px, exp_rate = flow_det.update(img)
+            flow_ms = (time.time() - t_fl) * 1000.0
+            flow_ema = flow_ms if flow_ema == 0 else 0.9 * flow_ema + 0.1 * flow_ms
+            exp_hist.append((loop_t, exp_rate))
+            while exp_hist and loop_t - exp_hist[0][0] > FLOW_WINDOW:
+                exp_hist.pop(0)
+
+        t_inf = time.time()
         depth = backend.infer(img)
+        infer_ms = (time.time() - t_inf) * 1000.0
+        infer_ema = infer_ms if infer_ema == 0 else 0.9 * infer_ema + 0.1 * infer_ms
         near = free_space(depth)
         # light per-column temporal smoothing: removes single-frame depth noise (so the
         # advance stop-threshold can't trip on one bad frame) without lagging real changes.
@@ -313,11 +400,20 @@ def main():
         fps = 1.0 / dt if dt > 0 else 0.0
         ema_fps = fps if ema_fps == 0 else 0.9 * ema_fps + 0.1 * fps
 
+        # time-to-contact from the WINDOWED expansion rate: 1/(rate*fps). Only trust it when the
+        # scene is actually moving (parked -> no parallax) and the windowed mean clears the noise
+        # floor (per-frame flow is symmetric noise; only a sustained +bias means real approach).
+        rate = (sum(e for _, e in exp_hist) / len(exp_hist)) if exp_hist else 0.0
+        ttc = 99.0
+        if rate > FLOW_RATE_MIN and ema_fps > 0 and motion >= 1.0:
+            ttc = round(min(99.0, 1.0 / (rate * ema_fps)), 2)
+
         atomic_write(STATE, json.dumps({
             "ts": round(loop_t, 3), "fps": round(ema_fps, 1),
             "near": {"l": round(near[0]), "c": round(near[1]), "r": round(near[2])},
             "clear": {"l": clr[0], "c": clr[1], "r": clr[2]},
             "clearest": clearest, "blocked": bool(blocked), "loom": loom,
+            "flow": round(flow_px, 2), "exp": round(rate, 4), "ttc": ttc,
             "motion": round(motion, 2), "target": target,
         }))
 
@@ -334,9 +430,10 @@ def main():
             if target["active"]:
                 tg = " | target %s bearing=%+.2f size=%.3f" % (
                     "LOST" if target["lost"] else "ok", target["bearing"], target["size"])
-            print("%.1ffps near L/C/R=%4d/%4d/%4d clearest=%s motion=%.1f%s%s"
-                  % (ema_fps, near[0], near[1], near[2], clearest, motion,
-                     " [BLOCKED]" if blocked else "", tg), flush=True)
+            print("%.1ffps read=%.0f infer=%.0f flow=%.0fms near L/C/R=%4d/%4d/%4d clearest=%s "
+                  "motion=%.1f flow=%+.2f ttc=%.1f%s%s"
+                  % (ema_fps, read_ema, infer_ema, flow_ema, near[0], near[1], near[2], clearest,
+                     motion, flow_px, ttc, " [BLOCKED]" if blocked else "", tg), flush=True)
 
         if period:
             sleep = period - (time.time() - loop_t)
