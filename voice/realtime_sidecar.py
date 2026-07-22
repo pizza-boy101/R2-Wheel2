@@ -1,19 +1,20 @@
 #!/usr/bin/env python3
 """
-Robot realtime sidecar: low-latency voice+drive control via the OpenAI Realtime API.
+Robot realtime sidecar — low-latency voice+drive copilot via the OpenAI Realtime API.
 
-For the "hear me, react, move NOW" use case: one bidirectional websocket to
-gpt-realtime, streaming mic audio up and voice audio down, with server-side semantic
-VAD and barge-in. The model drives the car through function tools (drive/stop/look)
-that bridge to the `move` script, so the firmware 300ms watchdog and the `.disarmed`
-kill switch still apply. Runs on the host (uses parec/paplay + the shared workspace).
+An alternative to the Claude-operative voice loop for the "hear me, react, move NOW"
+use case: one bidirectional websocket to gpt-realtime, streaming mic audio up and
+voice audio down, with server-side semantic VAD and barge-in. The model drives the
+car through function tools (drive/stop/look) that bridge to the SAME `move` script
+the operative uses — so the firmware 300ms watchdog and the `.disarmed` kill switch
+still apply. Runs on the host (reuses parec/paplay + the bind-mounted workspace).
 
 Env (all optional):
   OPENAI_KEY_FILE   path to the API key file      (default ~/robot/secrets/openai-realtime.key)
   REALTIME_MODEL    realtime model id             (default gpt-realtime-2)
   REALTIME_VOICE    output voice                  (default marin)
   LISTEN_SOURCE_MATCH / SPEECH_SINK_MATCH  pulse device substrings (default jabra)
-  ROBOT_WORKSPACE   workspace dir (move script + frame.jpg)(default ~/robot/workspace)
+  ROBOT_WORKSPACE   workspace dir (move/vision.txt)(default ~/robot/workspace)
   REALTIME_SMOKE=1  connect, say one line, exit (no mic) — for validation
   REALTIME_LOG      log file                      (default ~/robot/realtime.log)
 """
@@ -22,10 +23,12 @@ import sys
 import json
 import time
 import base64
+import socket
 import asyncio
 import subprocess
 from datetime import datetime
 
+import avoid                      # shared reactive-avoidance brain (decide + recovery_plan); see avoid.py
 import websockets
 from websockets.asyncio.client import connect as ws_connect
 
@@ -50,8 +53,19 @@ VOICE = env("REALTIME_VOICE", "marin")
 RATE = 24000
 WORKSPACE = env("ROBOT_WORKSPACE", os.path.join(HOME, "robot", "workspace"))
 MOVE = os.path.join(WORKSPACE, "move")
+DISARM = os.path.join(WORKSPACE, ".disarmed")       # kill switch flag (move disarm)
 FRAME_PATH = os.path.join(WORKSPACE, "frame.jpg")   # written by the perception loop
 NAV_STATE = os.path.join(WORKSPACE, "nav_state.json")  # perception's structured free-space output
+# guarded advance = roll forward and STEER AROUND obstacles locally, using the SAME
+# avoidance decision the autonomous loop uses (avoid.decide) — obstacle thresholds
+# (STOP_NEAR/SIDE_NEAR/LOOM_BRAKE) all live in avoid.py now, shared, so there's one brain.
+ADVANCE_MAX_SECS = float(env("ADVANCE_MAX_SECS", "20"))      # safety cap: navigating can cross a room; this bounds
+                                                             # a single 'go' so it can't roam indefinitely
+MAX_RECOVER = int(env("ADVANCE_MAX_RECOVER", "3"))           # give up (report wedged) after this many recoveries
+# stall fallback: commanded to move but the camera view stops changing -> wedged on something
+# depth can't see (a low box, chair leg, glass). decide() can't steer off it, so we recover.
+ADVANCE_MOTION_MIN = float(env("ADVANCE_MOTION_MIN", "5.0"))  # smoothed scene-motion below this = not moving
+ADVANCE_STALL_SECS = float(env("ADVANCE_STALL_SECS", "0.6"))  # ...for this long while driving = wedged
 # hybrid vision: on-demand look (crisp) + silent change-gated ambient push (cheap)
 LOOK_MAXDIM = int(env("VISION_LOOK_MAXDIM", "512"))
 LOOK_QUALITY = int(env("VISION_LOOK_QUALITY", "65"))
@@ -78,11 +92,19 @@ INSTRUCTIONS = (
     "what you are about to do or narrate a tool call — no 'let me grab a snapshot', 'one moment', "
     "'I'll check', 'hold on'. Call tools silently, then speak ONCE with the real answer or result "
     "(what you actually see, the status) — never a placeholder acknowledgement. "
-    "To move, call the drive tool with a direction, "
+    "MOVING FORWARD: there are two forward tools — choose by whether the user wants the car to STOP near "
+    "something or to GET somewhere. If they want it to come to them or approach something and stop (e.g. "
+    "'come here', 'advance until you're close to me then stop', 'move forward until something's in the way'), "
+    "call advance — it rolls forward and stops itself the instant something is close, then tells you why. If "
+    "they want it to travel or make its way somewhere (e.g. 'go forward', 'head over there', 'make your way to "
+    "the kitchen', 'explore'), call navigate — it rolls forward and steers around obstacles on its own, going "
+    "around things instead of stopping. Both react on their own and are continuous, so never re-issue forward "
+    "bursts or babysit them. Use the drive tool with direction forward ONLY for a tiny deliberate nudge. For "
+    "turning and strafing, use the drive tool with a direction, "
     "a speed from 0.6 to 1.0 (NEVER below 0.6 — below that the motors just stall and buzz and the car "
     "won't move; default to full speed 1.0 unless the user asks to go slower), and a short duration "
     "in seconds — prefer brief bursts (0.5 to 1.5 s) and re-check rather than long "
-    "blind drives. Call stop the instant the user says stop. "
+    "blind drives. Call stop the instant the user says stop (it also cancels an advance). "
     "VISION: you continuously receive short text camera updates like '(camera) most open left; target "
     "in view on the right' — which direction is most open, whether something is getting closer, and "
     "whether a tracked target is in view. This is your CONSTANT background awareness, so you almost "
@@ -107,8 +129,18 @@ TOOLS = [
          "speed": {"type": "number", "description": "0.6..1 (below 0.6 the motors stall and the car won't move), default 1"},
          "seconds": {"type": "number", "description": "burst length, keep <= 2"}},
          "required": ["direction"]}},
+    {"type": "function", "name": "advance",
+     "description": "Roll forward and automatically STOP the moment something is close ahead, using the live camera. Use this when the user wants the car to come toward them or approach something and STOP before reaching it — e.g. 'come here and stop', 'advance until you're close to me then stop', 'move forward until something's in the way'. It reports back when it stops and why, so you do not re-issue or babysit it.",
+     "parameters": {"type": "object", "properties": {
+         "speed": {"type": "number", "description": "0.6..1 (below 0.6 the motors stall), default 1"}},
+         "required": []}},
+    {"type": "function", "name": "navigate",
+     "description": "Roll forward and STEER AROUND obstacles on its own — it turns toward the open side when something is ahead and keeps going, instead of stopping. Use this when the user wants the car to travel or get somewhere — e.g. 'go forward', 'head over there', 'make your way to the kitchen', 'explore'. It keeps moving and navigating by itself and reports back only if it has to give up (it gets wedged, or went as far as set), so you never re-issue or babysit it.",
+     "parameters": {"type": "object", "properties": {
+         "speed": {"type": "number", "description": "0.6..1 (below 0.6 the motors stall), default 1"}},
+         "required": []}},
     {"type": "function", "name": "stop",
-     "description": "Stop all motion immediately.",
+     "description": "Stop all motion immediately (also cancels a guarded advance).",
      "parameters": {"type": "object", "properties": {}, "required": []}},
     {"type": "function", "name": "look",
      "description": "Attach a fresh photo from the robot's forward camera so you can see the scene with your own eyes. Call before moving toward something or when asked what you see.",
@@ -156,7 +188,9 @@ def wait_pulse(kind, match, max_wait=20):
     return None
 
 
-# ---------- tool bridge (reuses the move script -> respects watchdog + kill switch) ----------
+# ---------- tool bridge: commands go to the motor daemon over its unix socket ----------
+# The daemon is the single owner of the serial link: it sustains motion via its own
+# watchdog resend, dead-mans if we stop sending, and enforces the .disarmed kill switch.
 def _clamp(v, lo, hi, d):
     try:
         return max(lo, min(hi, float(v)))
@@ -164,46 +198,142 @@ def _clamp(v, lo, hi, d):
         return d
 
 
-# background handle for the current motion, so a turn can run non-blocking (the event
-# loop stays free to see + react mid-turn) and stop / the next command can preempt it.
-_motion_proc = None
+MOTOR_SOCK = os.path.join(WORKSPACE, "motor.sock")
+_msock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
 
 
-def _kill_motion():
-    global _motion_proc
-    if _motion_proc is not None and _motion_proc.poll() is None:
-        try:
-            _motion_proc.terminate()
-        except Exception:
-            pass
-    _motion_proc = None
+def motor(cmd):
+    """Fire a command to the motor daemon. Silent no-op if it's down -> the car stays
+    still, which is the safe failure (never a second, racing serial writer)."""
+    try:
+        _msock.sendto(cmd.encode(), MOTOR_SOCK)
+    except Exception:
+        pass
+
+
+def args_of(args_json):
+    try:
+        return json.loads(args_json or "{}")
+    except Exception:
+        return {}
 
 
 def invoke_tool(name, args_json):
-    global _motion_proc
-    try:
-        args = json.loads(args_json or "{}")
-    except Exception:
-        args = {}
+    args = args_of(args_json)
     try:
         if name == "drive":
             d = args.get("direction", "forward")
             spd = _clamp(args.get("speed", 1.0), 0.6, 1.0, 1.0)   # 0.6 floor: below this the motors stall/buzz
             secs = _clamp(args.get("seconds", 1.0), 0.1, 2.0, 1.0)
-            _kill_motion()   # a new command preempts any in-flight turn
-            # non-blocking: the move script keeps resending for `secs` in the background,
-            # so the event loop stays free to receive frames and issue a stop mid-turn.
-            _motion_proc = subprocess.Popen([MOVE, d, "%.2f" % spd, "%.2f" % secs],
-                                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            return {"ok": True, "detail": "driving %s at %.2f for up to %.1fs (non-blocking)" % (d, spd, secs)}
+            motor("%s %.2f %.2f" % (d, spd, secs))   # timed move: the daemon drives for secs then stops
+            return {"ok": True, "detail": "driving %s at %.2f for %.1fs" % (d, spd, secs)}
         if name == "stop":
-            _kill_motion()   # preempt the in-flight turn, then halt
-            subprocess.run([MOVE, "stop"], capture_output=True, timeout=5)
+            motor("stop")
             return {"ok": True, "detail": "stopped"}
         # note: "look" is handled specially in the receiver (it attaches an image), not here
     except Exception as e:
         return {"ok": False, "error": str(e)}
     return {"error": "unknown tool %s" % name}
+
+
+async def guarded_forward(speed, enqueue, steer):
+    """Roll forward under local, on-the-box control — no cloud in this loop, so it reacts in
+    ~one perception frame (~100 ms), not the ~1-2 s voice round-trip. Two modes, both using
+    the SAME shared 'too close' thresholds (avoid.py):
+
+      steer=False  (the `advance` tool): go straight and STOP the instant something is close
+        ahead — for "come here and stop", "advance until you're near me then stop".
+      steer=True   (the `navigate` tool): go forward and STEER AROUND obstacles (avoid.decide),
+        turning toward the open side and continuing — for "go / head over there / get somewhere".
+
+    Both end on the terminal conditions (kill switch, time cap, lost camera). Stop-mode also
+    ends when blocked or bumped. Steer-mode instead turns, and if wedged on something depth
+    can't see it recovers (reverse + turn via avoid.recovery_plan) and continues. Cancelling
+    (stop / new command / disconnect) halts silently; a terminal end reports why so the model
+    can speak it."""
+    cancelled = False
+    reason = "went as far as I could"
+    start = time.monotonic()
+    mot_ema = None
+    stall_since = None
+    last_recover = 0.0
+    recover_count = 0
+    cur = None                     # current action, for decide()'s hysteresis (steer mode)
+    turn_started = 0.0
+    try:
+        while True:
+            now = time.monotonic()
+            if os.path.exists(DISARM):
+                reason = "the kill switch is on"
+                break
+            if now - start > ADVANCE_MAX_SECS:
+                reason = "went as far as I set"
+                break
+            st = read_nav_state()
+            if st is None:
+                reason = "I lost the camera feed"     # never keep driving blind
+                break
+            n = st.get("near", {}) or {}
+            l, c, r = n.get("l", 0), n.get("c", 0), n.get("r", 0)
+            loom = st.get("loom", 0) or 0
+
+            if steer:
+                act, turn_started = avoid.decide(l, c, r, loom, cur, turn_started, now)  # turn, don't stop
+                spd = speed if act == "forward" else max(0.6, speed)   # 0.6 floor: below it the motors stall
+                motor("%s %.2f" % (act, spd))
+                cur = act
+            else:
+                # stop-mode: same 'blocked' test decide() uses, but we STOP instead of turning
+                if (c >= avoid.STOP_NEAR or l >= avoid.SIDE_NEAR
+                        or r >= avoid.SIDE_NEAR or loom >= avoid.LOOM_BRAKE):
+                    reason = "something's right ahead"
+                    break
+                motor("forward %.2f" % speed)          # refresh every loop (keeps the daemon dead-man alive)
+
+            # bumped/wedged: driving but the view stops changing -> stuck on something depth can't
+            # see. stop-mode stops + reports; steer-mode recovers (reverse+turn) and continues.
+            mot = st.get("motion")
+            if mot is not None:
+                mot_ema = mot if mot_ema is None else 0.7 * mot_ema + 0.3 * mot
+            if (mot_ema is not None and (now - start) > 0.6
+                    and (now - last_recover) > (ADVANCE_STALL_SECS + 0.7)):   # grace / post-recover cooldown
+                if mot_ema < ADVANCE_MOTION_MIN:
+                    if stall_since is None:
+                        stall_since = now
+                    elif now - stall_since >= ADVANCE_STALL_SECS:
+                        if not steer:
+                            reason = "I bumped into something"
+                            break
+                        recover_count += 1
+                        if recover_count >= MAX_RECOVER:
+                            reason = "I got wedged and couldn't free myself"
+                            break
+                        log("navigate: wedged (motion~%.1f) -> recover #%d" % (mot_ema, recover_count))
+                        for cmd, rspd, rsecs in avoid.recovery_plan(st):   # self-expiring timed moves
+                            motor("%s %.2f %.2f" % (cmd, rspd, rsecs))
+                            await asyncio.sleep(rsecs + 0.05)
+                        motor("stop")
+                        cur = None
+                        stall_since = None
+                        mot_ema = None
+                        last_recover = time.monotonic()
+                        continue
+                else:
+                    stall_since = None
+                    recover_count = 0                  # real progress -> reset the give-up counter
+            await asyncio.sleep(0.05)          # ~20Hz guard poll
+    except asyncio.CancelledError:
+        cancelled = True
+        raise
+    finally:
+        motor("stop")
+        log("%s stopped: %s" % ("navigate" if steer else "advance",
+                                "cancelled" if cancelled else reason))
+    # terminal end only (cancellation re-raises above): tell the model so it can speak it
+    await enqueue({"type": "conversation.item.create", "item": {
+        "type": "message", "role": "user",
+        "content": [{"type": "input_text", "text": "(camera) stopped moving — %s" % reason}]}})
+    await enqueue({"type": "response.create"})
 
 
 # ---------- camera frames -> data URLs, + cheap change detection ----------
@@ -361,9 +491,24 @@ async def main():
         """One connection lifecycle; returns when the socket drops or stop_event fires."""
         send_q = asyncio.Queue()          # fresh per-connection queue (drops stale events on reconnect)
         last_activity = {"t": 0.0}        # monotonic time of last voice activity; gates ambient pushes
+        adv = {"task": None}              # in-flight guarded-advance task, if any
 
         async def enqueue(evt):
             await send_q.put(evt)
+
+        async def cancel_advance():
+            """Halt any running guarded advance and wait for it to release the motors,
+            so a following stop/drive never races the advance's own stop."""
+            tk = adv["task"]
+            if tk is not None and not tk.done():
+                tk.cancel()
+                try:
+                    await tk
+                except asyncio.CancelledError:
+                    pass
+                except Exception:
+                    pass
+            adv["task"] = None
 
         async with ws_connect(url, additional_headers=headers, max_size=None,
                               ping_interval=15, ping_timeout=30) as ws:
@@ -458,7 +603,20 @@ async def main():
                             if durl:
                                 await enqueue(image_item(durl, "Current camera view (look):", LOOK_DETAIL))
                             await enqueue({"type": "response.create"})
+                        elif name in ("advance", "navigate"):
+                            # continuous, locally-reactive driving: hand off to a background task.
+                            # advance = roll forward + STOP when close; navigate = STEER AROUND
+                            # obstacles (avoid.decide). Reports back on a terminal stop.
+                            await cancel_advance()
+                            spd = _clamp(args_of(arguments).get("speed", 1.0), 0.6, 1.0, 1.0)
+                            steer = (name == "navigate")
+                            adv["task"] = asyncio.create_task(guarded_forward(spd, enqueue, steer))
+                            adv["task"].add_done_callback(_log_task_death)
+                            await enqueue(func_output(call_id, {"ok": True, "detail": (
+                                "on my way; steering around obstacles" if steer
+                                else "rolling forward; I'll stop when I'm close to something")}))
                         else:
+                            await cancel_advance()   # drive/stop preempt a guarded advance
                             result = invoke_tool(name, arguments)
                             log("[tool result] %s" % json.dumps(result)[:160])
                             await enqueue(func_output(call_id, result))
@@ -508,6 +666,7 @@ async def main():
                 if SMOKE:
                     stop_event.set()
             finally:
+                await cancel_advance()   # never leave the car rolling if the socket drops
                 for tk in tasks:
                     tk.cancel()
                 waiter.cancel()
