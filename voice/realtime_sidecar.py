@@ -56,6 +56,7 @@ MOVE = os.path.join(WORKSPACE, "move")
 DISARM = os.path.join(WORKSPACE, ".disarmed")       # kill switch flag (move disarm)
 FRAME_PATH = os.path.join(WORKSPACE, "frame.jpg")   # written by the perception loop
 NAV_STATE = os.path.join(WORKSPACE, "nav_state.json")  # perception's structured free-space output
+CHAT_SOCK = os.path.join(WORKSPACE, "chat.sock")    # typed messages from the debug dashboard arrive here
 # guarded advance = roll forward and STEER AROUND obstacles locally, using the SAME
 # avoidance decision the autonomous loop uses (avoid.decide) — obstacle thresholds
 # (STOP_NEAR/SIDE_NEAR/LOOM_BRAKE) all live in avoid.py now, shared, so there's one brain.
@@ -66,6 +67,11 @@ MAX_RECOVER = int(env("ADVANCE_MAX_RECOVER", "3"))           # give up (report w
 # depth can't see (a low box, chair leg, glass). decide() can't steer off it, so we recover.
 ADVANCE_MOTION_MIN = float(env("ADVANCE_MOTION_MIN", "5.0"))  # smoothed scene-motion below this = not moving
 ADVANCE_STALL_SECS = float(env("ADVANCE_STALL_SECS", "0.6"))  # ...for this long while driving = wedged
+# scan = "turn a small step, then look" — the search primitive (spin-until-you-see-it). Deliberately
+# a small step so it doesn't overshoot; the model calls it repeatedly and reads the photo each time.
+SCAN_TURN_SPEED = float(env("SCAN_TURN_SPEED", "0.7"))
+SCAN_TURN_SECS = float(env("SCAN_TURN_SECS", "0.2"))   # rotation per step; tune on the floor (turns are fast)
+SCAN_SETTLE = float(env("SCAN_SETTLE", "0.35"))        # let blur clear + a fresh frame.jpg land before the photo
 # hybrid vision: on-demand look (crisp) + silent change-gated ambient push (cheap)
 LOOK_MAXDIM = int(env("VISION_LOOK_MAXDIM", "512"))
 LOOK_QUALITY = int(env("VISION_LOOK_QUALITY", "65"))
@@ -111,13 +117,26 @@ INSTRUCTIONS = (
     "always already know the current scene without looking; use it directly. Do NOT call look for "
     "ordinary moves or to check those things — you already have them. Call the look tool ONLY when the "
     "user asks what you see or you must actually identify/describe something with your own eyes. "
-    "SEARCHING: when told to turn or move until you see something, do NOT tap in tiny increments. "
-    "Start a CONTINUOUS turn at the SLOWEST speed that still reliably moves the car, which is 0.6 "
-    "(never lower — below 0.6 it just stalls and buzzes), and keep re-issuing it so the motion never "
-    "pauses, watching the ambient camera updates as it sweeps (they tell you the instant the target "
-    "comes into view). Driving is non-blocking, so you stay aware while moving. There is ~1-2 s of "
-    "reaction lag, so expect some overshoot even at 0.6; call stop the INSTANT an update says the "
-    "target is in view (stop preempts the turn)."
+    "SEARCHING / FINDING: when asked to look around, spin until you see something, or find or identify a "
+    "thing, use the scan tool, NOT drive. Each scan call turns the car a small step to the LEFT or RIGHT "
+    "(you pick) and hands you a fresh photo. Choose the direction on purpose, toward where the thing "
+    "should be: if you just turned right and it was ahead of you, scan left to bring it back; if you last "
+    "saw it on one side, scan that way. Look at each photo; if what you're after isn't in it, scan again, "
+    "step by step (a full turn is several scans). Getting it CLEARLY in view matters: if it first shows up "
+    "as just a sliver at the edge of the frame, you've only caught the very start of it — do NOT act yet. "
+    "Keep scanning a small step or two more the same way until it is fully in view and roughly centered, "
+    "and only THEN stop scanning and either say what it is or head toward it. Don't take big blind turns to "
+    "search. Chain the scans yourself — scan, read the view, decide, scan again — without waiting to be "
+    "prompted. "
+    "GOING TO SOMETHING (a mission): when asked to find something and go to it, run the whole job yourself "
+    "as a loop, speaking only a short update at each stage. First sweep with scan to find it. If a full "
+    "sweep turns up nothing, turn toward the most open direction the camera reports and navigate forward a "
+    "little to a new spot, then sweep again from there; repeat until you find it. Once it is clearly and "
+    "fully in view (not just a sliver at the edge), turn to put it roughly straight ahead (scan toward it) "
+    "before driving, then navigate toward it, and every so often scan "
+    "again to re-center it as it drifts, since navigate only rolls forward and around obstacles. When you "
+    "get close, use advance so you stop just short of it. Keep the loop going until you've reached it or "
+    "it's clearly not findable — don't stop after one step or wait to be told to keep going."
 )
 
 TOOLS = [
@@ -145,6 +164,12 @@ TOOLS = [
     {"type": "function", "name": "look",
      "description": "Attach a fresh photo from the robot's forward camera so you can see the scene with your own eyes. Call before moving toward something or when asked what you see.",
      "parameters": {"type": "object", "properties": {}, "required": []}},
+    {"type": "function", "name": "scan",
+     "description": "Turn a small step to the LEFT or RIGHT (you choose) and take a photo — the way to look around for something. Use this whenever asked to spin, turn, or look around until you see, find, or identify something. Each call rotates the car a little the chosen way and hands you a fresh camera view; look at it, and if what you want isn't there, call scan again. Keep calling it to sweep (a full turn is several scans). Pick the direction deliberately, toward where the thing should be: if you just turned right and it was ahead of you, scan left to bring it back; if you last saw it on your left, scan left. The instant you see it, stop scanning and either say what it is or head toward it. Never use big blind turns to search.",
+     "parameters": {"type": "object", "properties": {
+         "direction": {"type": "string", "enum": ["left", "right"],
+                       "description": "which way to turn this step — left or right (default right)"}},
+         "required": []}},
 ]
 
 
@@ -603,6 +628,26 @@ async def main():
                             if durl:
                                 await enqueue(image_item(durl, "Current camera view (look):", LOOK_DETAIL))
                             await enqueue({"type": "response.create"})
+                        elif name == "scan":
+                            # search step: turn a small amount locally, let it settle, then hand over a
+                            # fresh photo so the model can recognise the target and decide whether to
+                            # keep scanning. This is what makes "spin until you see X" actually work.
+                            await cancel_advance()   # scanning owns the motors while it runs
+                            side = args_of(arguments).get("direction", "right")
+                            if side not in ("left", "right"):
+                                side = "right"
+                            turn = "ccw" if side == "left" else "cw"   # left = ccw, right = cw
+                            disarmed = os.path.exists(DISARM)
+                            if not disarmed:
+                                motor("%s %.2f %.2f" % (turn, SCAN_TURN_SPEED, SCAN_TURN_SECS))  # timed, self-expiring
+                                await asyncio.sleep(SCAN_TURN_SECS + SCAN_SETTLE)
+                            durl = await to_thread(frame_data_url, LOOK_MAXDIM, LOOK_QUALITY)
+                            note = ("kill switch is on — I can't turn, but here's the current view" if disarmed
+                                    else ("turned a step %s; view attached" % side if durl else "camera unavailable"))
+                            await enqueue(func_output(call_id, {"ok": durl is not None, "note": note}))
+                            if durl:
+                                await enqueue(image_item(durl, "Camera view after turning a step %s (scanning):" % side, LOOK_DETAIL))
+                            await enqueue({"type": "response.create"})
                         elif name in ("advance", "navigate"):
                             # continuous, locally-reactive driving: hand off to a background task.
                             # advance = roll forward + STOP when close; navigate = STEER AROUND
@@ -651,6 +696,43 @@ async def main():
                         last_push = now
                         log("ambient text: %s" % summary)
 
+            # ---- text chat input: typed messages from the debug dashboard, injected into the
+            # session exactly like spoken input (so the model replies + can call the same tools) ----
+            loop = asyncio.get_event_loop()
+            chat_sock = None
+            try:
+                try:
+                    os.unlink(CHAT_SOCK)
+                except OSError:
+                    pass
+                chat_sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+                chat_sock.setblocking(False)
+                chat_sock.bind(CHAT_SOCK)
+                os.chmod(CHAT_SOCK, 0o777)           # allow the dashboard (cross-uid) to send
+
+                def _on_chat():
+                    try:
+                        data, _ = chat_sock.recvfrom(65536)
+                    except Exception:
+                        return
+                    text = data.decode("utf-8", "ignore").strip()
+                    if not text:
+                        return
+                    log("You (chat): %s" % text)
+                    last_activity["t"] = time.monotonic()   # keep ambient pushes clear of this turn
+                    try:
+                        send_q.put_nowait({"type": "conversation.item.create", "item": {
+                            "type": "message", "role": "user",
+                            "content": [{"type": "input_text", "text": text}]}})
+                        send_q.put_nowait({"type": "response.create"})
+                    except Exception:
+                        pass
+
+                loop.add_reader(chat_sock.fileno(), _on_chat)
+                log("chat input ready")
+            except Exception as e:
+                log("chat input setup failed: %s" % e)
+
             tasks = [asyncio.create_task(sender()), asyncio.create_task(receiver())]
             if not SMOKE:
                 tasks.append(asyncio.create_task(mic()))
@@ -666,6 +748,15 @@ async def main():
                 if SMOKE:
                     stop_event.set()
             finally:
+                if chat_sock is not None:
+                    try:
+                        loop.remove_reader(chat_sock.fileno())
+                    except Exception:
+                        pass
+                    try:
+                        chat_sock.close()
+                    except Exception:
+                        pass
                 await cancel_advance()   # never leave the car rolling if the socket drops
                 for tk in tasks:
                     tk.cancel()
