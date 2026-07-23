@@ -98,18 +98,26 @@ LOCK_BOX = {"small": (0.16, 0.20), "medium": (0.30, 0.36), "large": (0.50, 0.56)
 # a small step so it doesn't overshoot; the model calls it repeatedly and reads the photo each time.
 SCAN_TURN_SPEED = float(env("SCAN_TURN_SPEED", "0.65"))  # slower than before to curb scan overshoot; held near
                                                          # the motor floor (the left-wheel trim eats into this)
-SCAN_TURN_SECS = float(env("SCAN_TURN_SECS", "0.15"))  # shorter step too: overshoot = one committed step, so a
-                                                       # smaller step overshoots less when it decides to stop
+SCAN_TURN_SECS = float(env("SCAN_TURN_SECS", "0.35"))  # step size: turn roughly one camera field-of-view per
+                                                       # step so consecutive frames tile ~edge-to-edge (the near
+                                                       # side of each new view overlaps the far side of the last),
+                                                       # covering the room in fewer steps without leaving gaps
+SCAN_NUDGE_SECS = float(env("SCAN_NUDGE_SECS", "0.1"))     # fine-centering turn: a tiny step to slide a target
+                                                           # that's already in view toward the middle of the frame
 SCAN_SETTLE = float(env("SCAN_SETTLE", "1.0"))         # dwell after each turn step: let motion blur clear, a fresh
                                                        # frame.jpg land, AND give the model time to process before
                                                        # the next burst (0.35 -> 0.7 -> 1.0; was overshooting a step)
+SCAN_NUDGE_SETTLE = float(env("SCAN_NUDGE_SETTLE", "0.4"))  # shorter dwell for centering — the target's already in
+                                                           # view, so converge quickly instead of the full dwell
+SCAN_NUDGE_INTERVAL = float(env("SCAN_NUDGE_INTERVAL", "0.6"))  # light pacing between centering nudges (NOT the
+                                                               # full sweep floor) so a few taps can centre it
 SCAN_SWEEP_GAP = float(env("SCAN_SWEEP_GAP", "5.0"))   # a scan after this long of no scanning starts a NEW sweep:
                                                        # look at the current view WITHOUT turning first, so the bot
                                                        # registers where it is before it ever moves
 SCAN_MIN_INTERVAL = float(env("SCAN_MIN_INTERVAL", "3.0"))  # HARD floor between consecutive scan turns. The voice
                                                        # model fires scans as fast as it gets photos; this paces the
                                                        # actual turning so it can't outrun itself. Raise to slow scans.
-SCAN_FULL_TURN_STEPS = int(env("SCAN_FULL_TURN_STEPS", "10"))  # ~how many scan steps make a full 360 (no compass, so
+SCAN_FULL_TURN_STEPS = int(env("SCAN_FULL_TURN_STEPS", "5"))  # ~how many scan steps make a full 360 (no compass, so
                                                               # we count steps as a crude 'how far around am I' and
                                                               # tell the model, so it doesn't quit before it's checked
                                                               # behind itself). Rough; tune on the floor.
@@ -167,10 +175,11 @@ INSTRUCTIONS = (
     "always read the photo and decide before you scan again. Choose the direction on purpose, toward where the thing "
     "should be: if you just turned right and it was ahead of you, scan left to bring it back; if you last "
     "saw it on one side, scan that way. Look at each photo; if what you're after isn't in it, scan again, "
-    "step by step (a full turn is several scans). Getting it CLEARLY in view matters: if it first shows up "
-    "as just a sliver at the edge of the frame, you've only caught the very start of it — do NOT act yet. "
-    "Keep scanning a small step or two more the same way until it is fully in view and roughly centered, "
-    "and only THEN stop scanning and either say what it is or head toward it. Don't take big blind turns to "
+    "step by step (a full turn is several scans). Getting it CLEARLY in view AND centered matters: if it "
+    "first shows up as just a sliver at the edge of the frame, you've only caught the very start of it — do "
+    "NOT act yet. Once it IS in view but sitting off to one side, switch to small centring nudges: scan with "
+    "amount 'center' toward that side, a touch at a time, reading each photo, until it sits in the middle of "
+    "the frame. Only THEN stop scanning and either say what it is or head toward it. Don't take big blind turns to "
     "search. Chain the scans yourself — scan, read the view, decide, scan again — without waiting to be "
     "prompted. IMPORTANT — don't give up early: a few steps only covers a small arc, and something behind "
     "you takes about half a full circle of steps to come into view. Keep scanning the SAME direction, step "
@@ -222,10 +231,12 @@ TOOLS = [
      "description": "Attach a fresh photo from the robot's forward camera so you can see the scene with your own eyes. Call before moving toward something or when asked what you see.",
      "parameters": {"type": "object", "properties": {}, "required": []}},
     {"type": "function", "name": "scan",
-     "description": "Look around for something, a small step at a time. The FIRST scan of a search hands you the view from where you already are WITHOUT moving — look at it first. Each scan after that turns the car a small step to the LEFT or RIGHT (you choose) and hands you a fresh camera view, so calling scan again means 'I've looked at that view, keep going.' Always read each photo and decide before scanning again; if what you want isn't there, scan once more. Keep calling it to sweep (a full turn is several scans). Pick the direction deliberately, toward where the thing should be: if you just turned right and it was ahead of you, scan left to bring it back; if you last saw it on your left, scan left. The instant you see it clearly, stop scanning and either say what it is or head toward it. Never use big blind turns to search.",
+     "description": "Look around for something. The FIRST scan of a search hands you the view from where you already are WITHOUT moving — look at it first. Each scan after that turns the car and hands you a fresh camera view, so calling scan again means 'I've looked at that view, keep going.' Two step sizes via amount: 'step' (default) turns about one camera-width so each new view picks up right where the last one ended — use this to sweep a room; 'center' turns just a hair — use this ONCE THE THING IS ALREADY IN VIEW but off to one side, scanning 'center' toward it (repeat if needed) until it sits in the middle of the frame, then lock on and go to it. Always read each photo and decide before scanning again. When sweeping, pick the direction deliberately toward where the thing should be. Never use big blind turns to search.",
      "parameters": {"type": "object", "properties": {
          "direction": {"type": "string", "enum": ["left", "right"],
-                       "description": "which way to turn this step — left or right (default right)"}},
+                       "description": "which way to turn — left or right (default right)"},
+         "amount": {"type": "string", "enum": ["step", "center"],
+                    "description": "'step' = a full camera-width sweep step (default); 'center' = a tiny centring nudge for a target that's already in view but off to one side"}},
          "required": []}},
     {"type": "function", "name": "lock_on",
      "description": "Lock onto the thing you want to drive to, so the robot can track it and home in. Call this ONLY once the target is clearly and fully in view and roughly CENTRED in the frame (scan toward it first until it's centred) — it locks onto whatever is in the middle of the view. After it locks, call go_to. If it says it couldn't lock, centre the target better and try again.",
@@ -941,42 +952,70 @@ async def main():
                             # view, keep going" — so it turns a step, then hands over the new view. This
                             # gates every move on a registered image and stops it running a step ahead.
                             await cancel_advance()   # scanning owns the motors while it runs
-                            side = args_of(arguments).get("direction", "right")
+                            sargs = args_of(arguments)
+                            side = sargs.get("direction", "right")
                             if side not in ("left", "right"):
                                 side = "right"
+                            amount = sargs.get("amount", "step")
+                            if amount not in ("step", "center"):
+                                amount = "step"
                             turn = "ccw" if side == "left" else "cw"   # left = ccw, right = cw
                             disarmed = os.path.exists(DISARM)
                             now_m = time.monotonic()
-                            fresh_sweep = (now_m - scan_st["last"]) > SCAN_SWEEP_GAP
+                            prev_last = scan_st["last"]
                             scan_st["last"] = now_m
-                            if fresh_sweep:
-                                scan_st["steps"] = 0
-                            did_turn = (not disarmed) and (not fresh_sweep)
-                            if did_turn:
-                                # hard pace: don't turn again until SCAN_MIN_INTERVAL since the last turn, so
-                                # the bot can't scan faster than this no matter how fast the model calls
-                                wait = SCAN_MIN_INTERVAL - (now_m - scan_st["last_turn"])
-                                if wait > 0:
-                                    await asyncio.sleep(wait)
-                                scan_st["steps"] += 1
-                                scan_st["last_turn"] = time.monotonic()
-                                motor("%s %.2f %.2f" % (turn, SCAN_TURN_SPEED, SCAN_TURN_SECS))  # timed, self-expiring
-                                await asyncio.sleep(SCAN_TURN_SECS + SCAN_SETTLE)
+                            if amount == "center":
+                                # fine-centering: a tiny nudge to slide an already-seen target toward the
+                                # middle. Lightly paced (NOT the full sweep floor) so it converges in a few
+                                # taps, and it doesn't count toward the full-circle sweep.
+                                if not disarmed:
+                                    wait = SCAN_NUDGE_INTERVAL - (now_m - scan_st["last_turn"])
+                                    if wait > 0:
+                                        await asyncio.sleep(wait)
+                                    scan_st["last_turn"] = time.monotonic()
+                                    motor("%s %.2f %.2f" % (turn, SCAN_TURN_SPEED, SCAN_NUDGE_SECS))
+                                    await asyncio.sleep(SCAN_NUDGE_SECS + SCAN_NUDGE_SETTLE)
+                                else:
+                                    await asyncio.sleep(SCAN_NUDGE_SETTLE)
+                                durl = await to_thread(frame_data_url, LOOK_MAXDIM, LOOK_QUALITY)
+                                if disarmed:
+                                    note = "kill switch is on — I can't nudge, but here's the current view"
+                                    cap = "Current camera view (can't turn — kill switch on):"
+                                else:
+                                    note = ("nudged a hair %s to centre it. If it's centred now, lock on and go "
+                                            "to it (or say what it is); if it's still off to that side, scan "
+                                            "'center' %s again a touch." % (side, side))
+                                    cap = "Camera view after a small centring nudge %s:" % side
                             else:
-                                await asyncio.sleep(SCAN_SETTLE)   # settle for a clean frame even without turning
-                            durl = await to_thread(frame_data_url, LOOK_MAXDIM, LOOK_QUALITY)
-                            steps = scan_st["steps"]
-                            if disarmed:
-                                note = "kill switch is on — I can't turn, but here's the current view"
-                                cap = "Current camera view (can't turn — kill switch on):"
-                            elif did_turn:
-                                note = ("turned a step %s (step %d of ~%d for a full circle); decide before "
-                                        "scanning again. If you haven't found it, keep scanning the same way — "
-                                        "you've only covered part of the way around." % (side, steps, SCAN_FULL_TURN_STEPS))
-                                cap = "Camera view after turning a step %s (scan step %d/~%d):" % (side, steps, SCAN_FULL_TURN_STEPS)
-                            else:
-                                note = "here's the view from where I am (start of sweep); scan again to turn a step %s" % side
-                                cap = "Current camera view (start of sweep, not turned yet):"
+                                fresh_sweep = (now_m - prev_last) > SCAN_SWEEP_GAP
+                                if fresh_sweep:
+                                    scan_st["steps"] = 0
+                                did_turn = (not disarmed) and (not fresh_sweep)
+                                if did_turn:
+                                    # hard pace: don't turn again until SCAN_MIN_INTERVAL since the last turn, so
+                                    # the bot can't scan faster than this no matter how fast the model calls
+                                    wait = SCAN_MIN_INTERVAL - (now_m - scan_st["last_turn"])
+                                    if wait > 0:
+                                        await asyncio.sleep(wait)
+                                    scan_st["steps"] += 1
+                                    scan_st["last_turn"] = time.monotonic()
+                                    motor("%s %.2f %.2f" % (turn, SCAN_TURN_SPEED, SCAN_TURN_SECS))  # timed, self-expiring
+                                    await asyncio.sleep(SCAN_TURN_SECS + SCAN_SETTLE)
+                                else:
+                                    await asyncio.sleep(SCAN_SETTLE)   # settle for a clean frame even without turning
+                                durl = await to_thread(frame_data_url, LOOK_MAXDIM, LOOK_QUALITY)
+                                steps = scan_st["steps"]
+                                if disarmed:
+                                    note = "kill switch is on — I can't turn, but here's the current view"
+                                    cap = "Current camera view (can't turn — kill switch on):"
+                                elif did_turn:
+                                    note = ("turned a step %s (step %d of ~%d for a full circle); decide before "
+                                            "scanning again. If you haven't found it, keep scanning the same way — "
+                                            "you've only covered part of the way around." % (side, steps, SCAN_FULL_TURN_STEPS))
+                                    cap = "Camera view after turning a step %s (scan step %d/~%d):" % (side, steps, SCAN_FULL_TURN_STEPS)
+                                else:
+                                    note = "here's the view from where I am (start of sweep); scan again to turn a step %s" % side
+                                    cap = "Current camera view (start of sweep, not turned yet):"
                             await enqueue(func_output(call_id, {"ok": durl is not None,
                                                                 "note": note if durl else "camera unavailable"}))
                             if durl:
