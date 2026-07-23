@@ -40,6 +40,36 @@ BACK_SECS = float(env("NAV_BACK_SECS", "0.5"))
 TURN_SPEED = float(env("NAV_TURN_SPEED", "1.0"))
 RECOVER_TURN_SECS = float(env("NAV_RECOVER_TURN_SECS", "0.7"))
 
+# --- forward metric distance (HC-SR04 front sonar), fused into the `advance` stop ---
+# The camera nearness is *relative* (varies with light/texture) and blind to clear/transparent
+# surfaces; the front sonar gives a true centimetre distance straight ahead. `advance` ("roll up
+# to something and stop") is exactly a forward-distance task, so the sonar sets a real standoff
+# and tapers speed as we close in. Lives here in the one brain so nav/navigate can adopt it too.
+STOP_CM = float(env("STOP_CM", "35"))            # stop this far (cm) from whatever's dead ahead
+SLOW_CM = float(env("SLOW_CM", "90"))            # begin easing off speed here (needs runway: at
+                                                 # full speed + ~150ms pipeline + coast, 45cm was
+                                                 # too tight and it drove into walls)
+MOTOR_FLOOR = float(env("MOTOR_FLOOR", "0.6"))   # below this the motors stall -> never command less
+
+
+def ultra_blocked(cm, valid):
+    """True when the front sonar says we're at/inside the standoff distance. An invalid reading
+    (nothing within range, or stale/missing -> caller passes valid=False) never blocks, so a
+    silent sonar hands control back to the camera instead of stranding the car."""
+    return bool(valid) and cm is not None and cm <= STOP_CM
+
+
+def approach_speed(cm, valid, speed):
+    """Taper forward speed by distance: full speed beyond SLOW_CM, easing to the motor floor as
+    it nears STOP_CM (0 at/inside it). No valid reading -> speed unchanged, so behaviour matches
+    the pre-sonar code whenever the sonar isn't talking."""
+    if not valid or cm is None or cm >= SLOW_CM:
+        return speed
+    if cm <= STOP_CM:
+        return 0.0
+    frac = (cm - STOP_CM) / (SLOW_CM - STOP_CM)          # 1.0 at SLOW_CM -> 0 at STOP_CM
+    return max(MOTOR_FLOOR, speed * frac)
+
 
 def decide(l, c, r, loom, cur_act, turn_started, now):
     """Choose forward/cw/ccw. Beyond the naive 'forward if center clear', B4 adds:

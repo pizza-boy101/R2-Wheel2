@@ -8,6 +8,11 @@
  *   M fl fr rl rr    direct per-wheel -1.0..1.0  (for calibration/testing)
  *   S                stop
  *
+ * Emits (unsolicited, one per line):
+ *   U <cm>           forward ultrasonic distance in cm (HC-SR04, faces forward under the
+ *                    camera). "U -1" = nothing within range. ~12 Hz. The motor daemon reads
+ *                    these off the same serial link and publishes them for the rest of the stack.
+ *
  * Safety: motors auto-stop if no valid command arrives within WATCHDOG_MS.
  *
  * This board's onboard demo peripherals (buttons/LEDs/buzzer on D2,D3,D4,D8,D9,
@@ -34,6 +39,23 @@ const uint8_t EN[4]  = {  9,    11,     6,     3  };  // ENA2, ENB2, ENB1, ENA1
 const uint8_t INA[4] = {  8,    13,     5,     2  };
 const uint8_t INB[4] = { 10,    12,     7,     4  };
 bool INVERT[4] = { true, true, false, false };  // FL,FR reversed-polarity -> flip
+
+// Per-wheel speed trim (open-loop veer correction). PWM sets how HARD each motor pushes, not
+// its RPM, so identical commands don't give identical wheel speeds -> the car drifts. It veers
+// right, i.e. the left side outruns the right, so the left wheels (FL=0, RL=2) run a touch
+// slower. This is a fixed correction (no encoder feedback), so re-tune if it drifts again after
+// a battery/surface change. 1.0 = full; lower = slower.  index: 0=FL 1=FR 2=RL 3=RR
+float TRIM[4] = { 0.93, 1.00, 0.93, 1.00 };
+
+// HC-SR04 forward ultrasonic (mounted under the camera, facing forward). All 12 digital
+// pins are taken by the two L298Ns, so it lives on the analog pins driven as digital:
+// A0 = trigger (out), A1 = echo (in). It only measures straight ahead -> collision / "how
+// far can I travel" distance, not left/right (the camera depth still does the side sensing).
+const uint8_t US_TRIG = A0;
+const uint8_t US_ECHO = A1;
+const unsigned long US_PERIOD_MS  = 50;      // ping cadence (~20 Hz) — faster = less reaction lag
+const unsigned long US_TIMEOUT_US = 20000;   // echo wait; ~3.4 m ceiling. 0 back => out of range
+unsigned long lastPing = 0;
 // --------------------------------------------------
 
 unsigned long lastCmd = 0;
@@ -47,7 +69,7 @@ void setMotor(uint8_t i, float v) {
   bool fwd = (v >= 0);
   digitalWrite(INA[i], fwd ? HIGH : LOW);
   digitalWrite(INB[i], fwd ? LOW  : HIGH);
-  analogWrite(EN[i], (int)(fabs(v) * 255.0 + 0.5));
+  analogWrite(EN[i], (int)(fabs(v) * 255.0 * TRIM[i] + 0.5));   // TRIM[i] = per-wheel veer correction
 }
 
 void stopAll() {
@@ -68,8 +90,21 @@ void applyVelocity(float vx, float vy, float w) {
   // scale down together if any wheel would exceed 1.0 (keeps the heading true)
   float mx = 1.0;
   for (uint8_t i = 0; i < 4; i++) { float a = fabs(m[i]); if (a > mx) mx = a; }
-  Serial.print("MIX "); Serial.print(m[0]/mx,2); Serial.print(" "); Serial.print(m[1]/mx,2); Serial.print(" "); Serial.print(m[2]/mx,2); Serial.print(" "); Serial.println(m[3]/mx,2);
   for (uint8_t i = 0; i < 4; i++) setMotor(i, m[i] / mx);
+}
+
+// Fire the HC-SR04 and print the distance. pulseIn blocks up to US_TIMEOUT_US (20 ms),
+// well under the 300 ms motor watchdog, so motion stays safe. Called on an interval, not
+// every loop, so command handling stays responsive.
+void pingUltrasonic() {
+  digitalWrite(US_TRIG, LOW);
+  delayMicroseconds(3);
+  digitalWrite(US_TRIG, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(US_TRIG, LOW);
+  unsigned long us = pulseIn(US_ECHO, HIGH, US_TIMEOUT_US);
+  if (us == 0) { Serial.println("U -1"); return; }   // no echo -> out of range / no target
+  Serial.print("U "); Serial.println(us / 58.0, 1);  // 58 us per cm round-trip
 }
 
 void handle(char* s) {
@@ -95,6 +130,9 @@ void setup() {
     pinMode(INA[i], OUTPUT);
     pinMode(INB[i], OUTPUT);
   }
+  pinMode(US_TRIG, OUTPUT);
+  pinMode(US_ECHO, INPUT);
+  digitalWrite(US_TRIG, LOW);
   stopAll();
   Serial.begin(115200);
   Serial.println("BOOT mecanum-uno ready");
@@ -111,4 +149,7 @@ void loop() {
     }
   }
   if (millis() - lastCmd > WATCHDOG_MS) stopAll();   // failsafe: stop if commands stop
+
+  unsigned long nowms = millis();                    // forward distance ping on its own cadence
+  if (nowms - lastPing >= US_PERIOD_MS) { lastPing = nowms; pingUltrasonic(); }
 }

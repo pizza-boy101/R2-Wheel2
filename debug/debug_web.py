@@ -16,6 +16,7 @@ import os
 import json
 import time
 import socket
+import subprocess
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
@@ -25,6 +26,7 @@ WORKSPACE = os.path.join(ROBOT, "workspace")
 NAV_STATE = os.path.join(WORKSPACE, "nav_state.json")
 FRAME = os.path.join(WORKSPACE, "frame.jpg")
 DISARM = os.path.join(WORKSPACE, ".disarmed")
+ULTRA = os.path.join(WORKSPACE, "ultrasonic.json")   # forward distance, published by motor daemon
 MODE = os.path.join(WORKSPACE, "nav_mode")
 LOGS = {"voice": os.path.join(ROBOT, "realtime.log"),
         "nav": os.path.join(ROBOT, "nav.log"),
@@ -33,6 +35,30 @@ LOGS = {"voice": os.path.join(ROBOT, "realtime.log"),
 PORT = int(os.environ.get("DEBUG_WEB_PORT", "8099"))
 CHAT_SOCK = os.path.join(WORKSPACE, "chat.sock")   # typed messages -> voice sidecar's live session
 _chatsock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+
+# voice runs as a systemd --user service; the dashboard starts/stops it on request.
+VOICE_UNIT = "robocar-voice"
+_UID = os.getuid()
+SYSTEMD_ENV = {**os.environ,
+               "XDG_RUNTIME_DIR": "/run/user/%d" % _UID,
+               "DBUS_SESSION_BUS_ADDRESS": "unix:path=/run/user/%d/bus" % _UID}
+_voice_cache = {"t": 0.0, "on": False}             # cache is-active; don't spawn systemctl every poll
+
+
+def voice_on():
+    """Whether the voice service is active. Cached ~1.5s so the 300ms /state poll stays cheap."""
+    now = time.time()
+    if now - _voice_cache["t"] < 1.5:
+        return _voice_cache["on"]
+    on = False
+    try:
+        r = subprocess.run(["systemctl", "--user", "is-active", VOICE_UNIT],
+                           env=SYSTEMD_ENV, capture_output=True, text=True, timeout=4)
+        on = (r.stdout.strip() == "active")
+    except Exception:
+        on = False
+    _voice_cache.update(t=now, on=on)
+    return on
 
 PAGE = """<!doctype html><html><head><meta charset=utf-8>
 <meta name=viewport content="width=device-width,initial-scale=1">
@@ -46,6 +72,8 @@ h1{font-size:14px;margin:0;font-weight:600}
 .pill{padding:2px 8px;border-radius:10px;font-weight:600}
 .armed{background:#5a1e1e;color:#ff9a9a}.disarmed{background:#1e3a2a;color:#7ee2a8}
 .mode{background:#1f2a44;color:#9ab7ff}
+.voiceon{background:#2d2148;color:#c9a3ff}.voiceoff{background:#21262d;color:#8b949e}
+.sonar{font-size:30px;font-weight:700;line-height:1.1}
 .btn{padding:3px 14px;border-radius:8px;border:1px solid #30363d;background:#21262d;color:#c9d1d9;cursor:pointer;font:inherit;font-weight:700}
 .btn.stop{background:#f85149;border-color:#f85149;color:#fff}
 .btn.go{background:#238636;border-color:#238636;color:#fff}
@@ -80,6 +108,8 @@ pre{background:#010409;border:1px solid #30363d;border-radius:6px;padding:8px;he
   <span id=arm class=pill>…</span>
   <button id=armBtn class=btn>…</button>
   <span class=hint>Esc = e-stop</span>
+  <span id=voice class=pill>…</span>
+  <button id=voiceBtn class=btn>…</button>
   <span id=mode class="pill mode">…</span>
   <span id=fps style=color:#8b949e>–</span>
   <span id=conn style=color:#8b949e>connecting…</span>
@@ -105,6 +135,10 @@ pre{background:#010409;border:1px solid #30363d;border-radius:6px;padding:8px;he
         <b>stop_near</b><span>680</span>
       </div>
     </div>
+    <div class=card><h2>distance ahead — ultrasonic (front)</h2>
+      <div class=sonar id=sonar>–</div>
+      <div class=hint id=sonarsub>waiting…</div>
+    </div>
     <div class=card><h2>chat (type to the bot)</h2>
       <div id=chatlog class=chatlog></div>
       <form id=chatform>
@@ -122,7 +156,7 @@ pre{background:#010409;border:1px solid #30363d;border-radius:6px;padding:8px;he
   <pre id=log></pre>
 </div></div>
 <script>
-var cur="voice", pos={voice:0,nav:0,motor:0,perception:0}, atBottom=true, disarmed=true;
+var cur="voice", pos={voice:0,nav:0,motor:0,perception:0}, atBottom=true, disarmed=true, voiceOn=false;
 var logEl=document.getElementById("log");
 function setArm(which){
   fetch("/"+which,{method:"POST"}).then(r=>r.json()).then(function(d){disarmed=!!d.disarmed;poll();}).catch(function(){});
@@ -130,6 +164,14 @@ function setArm(which){
 document.getElementById("armBtn").onclick=function(){
   if(disarmed){ if(!confirm("ARM the robot? It will be able to move.")) return; setArm("arm"); }
   else { setArm("disarm"); }
+};
+function setVoice(on){
+  fetch("/voice",{method:"POST",headers:{"Content-Type":"text/plain"},body:on?"on":"off"})
+    .then(r=>r.json()).then(function(d){voiceOn=(d.voice==="on");poll();}).catch(function(){});
+}
+document.getElementById("voiceBtn").onclick=function(){
+  if(voiceOn){ setVoice(false); }
+  else { if(!confirm("Turn the voice on? It opens the mic and the paid realtime API.")) return; setVoice(true); }
 };
 // Esc = emergency stop (instant disarm), from anywhere on the page
 document.addEventListener("keydown",function(e){ if(e.key==="Escape"){ e.preventDefault(); setArm("disarm"); } });
@@ -155,6 +197,18 @@ function poll(){
     var a=document.getElementById("arm"),b=document.getElementById("armBtn");
     if(disarmed){a.textContent="DISARMED";a.className="pill disarmed";b.textContent="▶ ARM";b.className="btn go";}
     else{a.textContent="ARMED";a.className="pill armed";b.textContent="◼ DISARM";b.className="btn stop";}
+    voiceOn=(s.voice==="on");
+    var v=document.getElementById("voice"),vb=document.getElementById("voiceBtn");
+    if(voiceOn){v.textContent="VOICE ON";v.className="pill voiceon";vb.textContent="◼ voice off";vb.className="btn stop";}
+    else{v.textContent="VOICE OFF";v.className="pill voiceoff";vb.textContent="▶ voice on";vb.className="btn go";}
+    // forward ultrasonic distance
+    var son=s.sonar,se=document.getElementById("sonar"),ss=document.getElementById("sonarsub");
+    if(son){
+      var age=(Date.now()/1000)-(son.ts||0);
+      if(age>2){se.textContent="—";se.style.color="#6e7681";ss.textContent="stale ("+age.toFixed(0)+"s) — motor daemon feeding?";}
+      else if(son.valid){var cm=son.cm;se.textContent=Math.round(cm)+" cm";se.style.color=(cm<25?"#f85149":(cm<50?"#d29922":"#7ee2a8"));ss.textContent="clear ahead: "+(cm/100).toFixed(2)+" m";}
+      else{se.textContent="clear";se.style.color="#7ee2a8";ss.textContent="nothing within ~3.4 m";}
+    }else{se.textContent="—";se.style.color="#6e7681";ss.textContent="no reading";}
     document.getElementById("mode").textContent="mode: "+(s.mode||"idle");
     var n=s.near;
     if(n){document.getElementById("nL").textContent=Math.round(n.l);document.getElementById("nC").textContent=Math.round(n.c);document.getElementById("nR").textContent=Math.round(n.r);
@@ -248,6 +302,12 @@ class H(BaseHTTPRequestHandler):
                         st["mode"] = f.read().strip() or "idle"
                 except Exception:
                     st["mode"] = "idle"
+                try:
+                    with open(ULTRA) as f:
+                        st["sonar"] = json.load(f)      # {ts, cm, valid}
+                except Exception:
+                    st["sonar"] = None
+                st["voice"] = "on" if voice_on() else "off"
                 self._send(200, "application/json", json.dumps(st).encode())
             elif u.path == "/frame.jpg":
                 try:
@@ -295,6 +355,19 @@ class H(BaseHTTPRequestHandler):
                 except FileNotFoundError:
                     pass
                 self._send(200, "application/json", json.dumps({"disarmed": os.path.exists(DISARM)}).encode())
+            elif u.path == "/voice":
+                want = body.decode("utf-8", "ignore").strip().lower()
+                action = "start" if want == "on" else "stop"
+                ok = False
+                try:
+                    r = subprocess.run(["systemctl", "--user", action, VOICE_UNIT],
+                                       env=SYSTEMD_ENV, capture_output=True, text=True, timeout=15)
+                    ok = (r.returncode == 0)
+                except Exception:
+                    ok = False
+                _voice_cache["t"] = 0.0             # force a fresh is-active read below
+                self._send(200, "application/json",
+                           json.dumps({"ok": ok, "voice": "on" if voice_on() else "off"}).encode())
             elif u.path == "/chat":
                 text = body.decode("utf-8", "ignore").strip()
                 ok = False

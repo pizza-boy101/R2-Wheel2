@@ -64,6 +64,8 @@ MEAN = (123.675, 116.28, 103.53)          # MiDaS small (imagenet mean * 255)
 FPS_CAP = float(env("PERCEPTION_FPS_CAP", "20"))   # raised from 12: FP16 gives the headroom, and
                                                    # fresher nav_state = lower reactive latency (old stack is off)
 STOP_NEAR = float(env("STOP_NEAR", "1000"))
+BOXED_NEAR = float(env("BOXED_NEAR", "600"))   # all three columns at/above this = boxed in (tight all around);
+                                               # a spatial-awareness cue for the planner, not a motion threshold
 CAM_INDEX = int(env("CAM_INDEX", "0"))
 CAM_WIDTH = int(env("CAM_WIDTH", "1280"))
 CAM_HEIGHT = int(env("CAM_HEIGHT", "720"))
@@ -415,6 +417,7 @@ def main():
             "clearest": clearest, "blocked": bool(blocked), "loom": loom,
             "flow": round(flow_px, 2), "exp": round(rate, 4), "ttc": ttc,
             "motion": round(motion, 2), "target": target,
+            "boxed_in": bool(near[0] >= BOXED_NEAR and near[1] >= BOXED_NEAR and near[2] >= BOXED_NEAR),
         }))
 
         # throttled frame.jpg for the voice sidecar (look/ambient)

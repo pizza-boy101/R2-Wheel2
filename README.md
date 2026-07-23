@@ -24,15 +24,28 @@ away things are from a single camera, about 29 times a second. So it has a real 
 moves, which is a second way to tell something is rushing up even when the distance guess is
 unreliable.
 
+It also feels. I added a little ultrasonic distance sensor pointing straight ahead, under the
+camera. Unlike the camera it gives a real measurement in centimetres, and because it uses sound
+instead of light it can "see" clear plastic and glass that the camera looks straight through.
+So when it rolls up to something now it stops a hand's width short, on a real distance, instead
+of a guess.
+
 It drives itself around things. This is the part I'm happiest about. A small loop on the
 robot reads the depth about twenty times a second and picks a move: go straight while the way
 ahead is clear, and turn toward the more open side when something gets close. So you can point
 it at a cluttered bit of floor and it threads through instead of stopping dead or crashing.
 
-It can hunt for things. Ask it to find something and it turns in small steps, taking a photo
-at each one, until the thing is clearly in view — then it can head over to it, checking again
-as it goes so it doesn't drift off. It isn't great at recognising things from across a room
-yet, but it looks around and works toward them instead of giving up after one glance.
+It can hunt for things and go to them. Ask it to find something and it turns in small, paced
+steps, taking a photo at each one, until the thing is clearly and fully in view. Then it locks
+on: a tracker on the robot follows that thing frame by frame, and the car drives to it on its
+own — keeping it centred, steering around whatever's in the way, and stopping just short. If it
+loses sight of it, it says so and looks again rather than wandering off blind.
+
+It thinks harder when it's stuck. The voice is quick but not a great planner, so when it gets
+genuinely stuck — a full spin turns up nothing, or it's boxed into a tight corner — it hands the
+situation to a stronger model for a moment and gets back a short plan ("back out, then check both
+sides, then head for the opening"), which it then carries out. It's the same split-brain idea one
+layer up: something fast for talking, something slower and smarter for thinking.
 
 It tries not to hurt itself or me. One program owns the link to the motors and keeps
 re-sending the current command faster than the firmware's timeout, so motion stays smooth;
@@ -57,7 +70,9 @@ split is basically the whole trick.
 The brain is an NVIDIA Jetson Orin Nano, running headless over wifi. The motor controller is
 a Keyestudio MAX, which is an Arduino Uno compatible board, driving two L298N H-bridges. The
 wheels are four DC motors with mecanum wheels, so it can strafe sideways, which is fun. The
-eyes are a plain USB webcam, and the ears and mouth are a Jabra USB speakerphone. For power,
+eyes are a plain USB webcam, and the ears and mouth are a Jabra USB speakerphone. There's also
+an HC-SR04 ultrasonic sensor on the front, wired to the Arduino (which is 5V, so it reads it
+directly) and reported up to the Jetson over the same serial link the motors use. For power,
 the motors run off a 12V battery and the Jetson has its own separate supply, which I learned
 the hard way (more on that below).
 
@@ -169,16 +184,20 @@ OPENAI_KEY_FILE=~/secrets/openai.key python3 voice/realtime_sidecar.py
 ```
 
 You'll need OpenCV built with CUDA, NumPy, websockets, and PulseAudio. The depth model and
-any API keys are deliberately not in this repo (see .gitignore), so you bring your own.
+any API keys are deliberately not in this repo (see .gitignore), so you bring your own. The
+voice needs an OpenAI key; the "think when stuck" planner needs an Anthropic one — both live in
+a secrets folder that isn't committed.
 
 ## What I want to add next
 
-- Make going to a specific thing rock solid. It can already search for something and head
-  toward it, but it loses track of the target on the way and has to keep re-checking; a proper
-  object tracker (or a depth camera) would let it lock on and go straight there.
-- Get a proper depth camera or a range sensor so the distances are real measurements instead
-  of estimates, especially for the see-through and thin things a plain camera struggles with.
-- Try building a simple map of a room so it can remember where things are instead of only
-  reacting to what's in front of it right now.
+- Give it a sense of angle. Right now it has no compass and the motors are open-loop, so it
+  can't turn a known number of degrees — it just nudges and re-checks. A cheap gyro (an IMU)
+  would let it turn to an actual heading, which would tidy up searching and stop the little
+  overshoots.
+- Build a simple map of a room from a spin, so it can remember where the openings and things
+  are instead of only reacting to what's right in front of it. The angle sense above is the
+  missing piece for this.
+- Keep making "go to that specific thing" more robust — the lock-on tracker works, but it can
+  still lose a target while squeezing past an obstacle and has to look again.
 
 Thanks for reading. This has been the most fun I've had learning something in a while.

@@ -28,8 +28,10 @@ Env: ROBOT_SERIAL (else auto-detect ttyUSB*/ttyACM*), MOTOR_SOCK, ROBOT_WORKSPAC
      MOTOR_RESEND (0.12 s), MOTOR_DEADMAN (0.5 s)
 """
 import os
+import json
 import time
 import glob
+import select
 import socket
 import signal
 import subprocess
@@ -45,8 +47,13 @@ def env(n, d):
 WORKSPACE = env("ROBOT_WORKSPACE", os.path.join(HOME, "robot", "workspace"))
 SOCK = env("MOTOR_SOCK", os.path.join(WORKSPACE, "motor.sock"))
 DISARM = os.path.join(WORKSPACE, ".disarmed")
-RESEND = float(env("MOTOR_RESEND", "0.12"))       # resend cadence (< firmware 300ms watchdog)
+ULTRA = env("ULTRA_STATE", os.path.join(WORKSPACE, "ultrasonic.json"))  # forward distance we publish
+RESEND = float(env("MOTOR_RESEND", "0.04"))       # loop/resend cadence (< firmware 300ms watchdog);
+                                                  # also sets how often we drain the serial for
+                                                  # "U <cm>" lines, so keep it at/under the ping rate
 DEADMAN = float(env("MOTOR_DEADMAN", "0.5"))      # sustained cmd auto-stops if not refreshed within this
+ULTRA_MIN_WRITE = float(env("ULTRA_MIN_WRITE", "0"))   # publish every reading (firmware caps at ~20Hz;
+                                                       # the write is tiny, so no throttle needed)
 BAUD = 115200
 
 # direction -> (vx, vy, w) unit velocity, matching the `move` script + firmware V protocol
@@ -79,6 +86,17 @@ def clamp(v, lo, hi, d):
         return d
 
 
+def write_ultra(cm, valid):
+    """Publish the latest forward distance for the dashboard / perception (atomic rename)."""
+    tmp = ULTRA + ".tmp"
+    try:
+        with open(tmp, "w") as f:
+            json.dump({"ts": time.time(), "cm": cm, "valid": valid}, f)
+        os.replace(tmp, ULTRA)
+    except Exception:
+        pass
+
+
 def main():
     signal.signal(signal.SIGTERM, _stop)
     signal.signal(signal.SIGINT, _stop)
@@ -87,14 +105,16 @@ def main():
     if not port:
         print("motor_daemon: FATAL — no serial port found", flush=True)
         return
-    # configure the line once (mirrors the move script; -hupcl avoids reset churn)
+    # configure the line once (mirrors the move script; -hupcl avoids reset churn, clocal so
+    # opening for read never blocks waiting on carrier)
     subprocess.run(["stty", "-F", port, str(BAUD), "cs8", "-cstopb", "-parenb",
-                    "raw", "-hupcl", "-echo"], stderr=subprocess.DEVNULL)
+                    "raw", "-hupcl", "clocal", "-echo"], stderr=subprocess.DEVNULL)
     try:
-        ser = open(port, "wb", buffering=0)
+        ser = open(port, "r+b", buffering=0)       # r+w: we write commands AND read "U <cm>" back
     except Exception as e:
         print("motor_daemon: FATAL — cannot open %s: %s" % (port, e), flush=True)
         return
+    serial_fd = ser.fileno()
     time.sleep(0.2)
 
     def w(line):
@@ -120,6 +140,9 @@ def main():
     target = None                                  # current V-string being commanded
     deadline = 0.0                                 # stop when now passes this
     was_disarmed = False
+    rbuf = b""                                      # inbound serial accumulator (for "U <cm>" lines)
+    ultra_pending = None                           # latest parsed (cm, valid), written throttled
+    last_ultra_write = 0.0
     w("S")                                         # start stopped
 
     while _run:
@@ -168,6 +191,31 @@ def main():
                     deadline = now + (secs if secs and secs > 0 else DEADMAN)
                     w(V)
             # unknown op -> ignore
+
+        # ---- drain inbound serial: pick up the firmware's "U <cm>" distance lines ----
+        try:
+            r, _, _ = select.select([serial_fd], [], [], 0)
+            if r:
+                chunk = os.read(serial_fd, 4096)
+                if chunk:
+                    rbuf += chunk
+                    *lines, rbuf = rbuf.split(b"\n")   # keep any trailing partial line in rbuf
+                    for line in lines:
+                        line = line.strip()
+                        if line[:2] == b"U ":
+                            try:
+                                cm = float(line[2:].strip())
+                            except Exception:
+                                continue
+                            ultra_pending = (None, False) if cm < 0 else (round(cm, 1), True)
+                    if len(rbuf) > 512:               # runaway guard (no newline arriving)
+                        rbuf = rbuf[-128:]
+        except Exception:
+            pass
+        if ultra_pending is not None and (now - last_ultra_write) >= ULTRA_MIN_WRITE:
+            write_ultra(*ultra_pending)
+            last_ultra_write = now
+            ultra_pending = None
 
         # ---- watchdog resend + dead-man + disarm enforcement ----
         if disarmed:

@@ -26,6 +26,7 @@ import base64
 import socket
 import asyncio
 import subprocess
+import urllib.request
 from datetime import datetime
 
 import avoid                      # shared reactive-avoidance brain (decide + recovery_plan); see avoid.py
@@ -51,11 +52,19 @@ KEY_FILE = env("OPENAI_KEY_FILE", os.path.join(HOME, "robot", "secrets", "openai
 MODEL = env("REALTIME_MODEL", "gpt-realtime-2")
 VOICE = env("REALTIME_VOICE", "marin")
 RATE = 24000
+# The `think` tool routes hard spatial-planning decisions to a stronger reasoning model (Claude).
+# The realtime voice model is fast but a weak planner; Claude reasons over the surroundings summary
+# and hands back a short plan the voice model then executes with its normal tools.
+PLANNER_KEY_FILE = env("ANTHROPIC_KEY_FILE", os.path.join(HOME, "robot", "secrets", "anthropic.key"))
+PLANNER_MODEL = env("PLANNER_MODEL", "claude-opus-4-8")
+PLANNER_MAXTOK = int(env("PLANNER_MAXTOK", "512"))
 WORKSPACE = env("ROBOT_WORKSPACE", os.path.join(HOME, "robot", "workspace"))
 MOVE = os.path.join(WORKSPACE, "move")
 DISARM = os.path.join(WORKSPACE, ".disarmed")       # kill switch flag (move disarm)
 FRAME_PATH = os.path.join(WORKSPACE, "frame.jpg")   # written by the perception loop
 NAV_STATE = os.path.join(WORKSPACE, "nav_state.json")  # perception's structured free-space output
+ULTRA = os.path.join(WORKSPACE, "ultrasonic.json")  # front sonar distance (motor daemon publishes it)
+GOAL = os.path.join(WORKSPACE, "nav_goal.json")     # we WRITE this to seed perception's target tracker
 CHAT_SOCK = os.path.join(WORKSPACE, "chat.sock")    # typed messages from the debug dashboard arrive here
 # guarded advance = roll forward and STEER AROUND obstacles locally, using the SAME
 # avoidance decision the autonomous loop uses (avoid.decide) — obstacle thresholds
@@ -67,11 +76,34 @@ MAX_RECOVER = int(env("ADVANCE_MAX_RECOVER", "3"))           # give up (report w
 # depth can't see (a low box, chair leg, glass). decide() can't steer off it, so we recover.
 ADVANCE_MOTION_MIN = float(env("ADVANCE_MOTION_MIN", "5.0"))  # smoothed scene-motion below this = not moving
 ADVANCE_STALL_SECS = float(env("ADVANCE_STALL_SECS", "0.6"))  # ...for this long while driving = wedged
+ULTRA_FRESH = float(env("ULTRA_FRESH", "0.5"))                # ignore sonar readings older than this (fall back to camera)
+# go_to (drive to a locked visual target): steer to keep it centred, skirt obstacles, stop on the sonar.
+GOTO_MAX_SECS = float(env("GOTO_MAX_SECS", "30"))             # safety cap on one homing run
+GOTO_LOST_SECS = float(env("GOTO_LOST_SECS", "1.2"))          # tracker 'lost' this long -> give up, ask to re-find
+GOTO_BEAR_DEAD = float(env("GOTO_BEAR_DEAD", "0.10"))         # |bearing| under this = centred enough
+GOTO_KP = float(env("GOTO_KP", "2.2"))                        # bearing -> turn-rate gain (proportional steering)
+GOTO_WMAX = float(env("GOTO_WMAX", "0.7"))                    # cap on the turn component
+GOTO_SIZE_ARRIVE = float(env("GOTO_SIZE_ARRIVE", "0.30"))    # target filling this frac of frame = we're there
+LOCK_BOX = {"small": (0.16, 0.20), "medium": (0.30, 0.36), "large": (0.50, 0.56)}  # centred seed-box (w,h)
 # scan = "turn a small step, then look" — the search primitive (spin-until-you-see-it). Deliberately
 # a small step so it doesn't overshoot; the model calls it repeatedly and reads the photo each time.
-SCAN_TURN_SPEED = float(env("SCAN_TURN_SPEED", "0.7"))
-SCAN_TURN_SECS = float(env("SCAN_TURN_SECS", "0.2"))   # rotation per step; tune on the floor (turns are fast)
-SCAN_SETTLE = float(env("SCAN_SETTLE", "0.35"))        # let blur clear + a fresh frame.jpg land before the photo
+SCAN_TURN_SPEED = float(env("SCAN_TURN_SPEED", "0.65"))  # slower than before to curb scan overshoot; held near
+                                                         # the motor floor (the left-wheel trim eats into this)
+SCAN_TURN_SECS = float(env("SCAN_TURN_SECS", "0.15"))  # shorter step too: overshoot = one committed step, so a
+                                                       # smaller step overshoots less when it decides to stop
+SCAN_SETTLE = float(env("SCAN_SETTLE", "1.0"))         # dwell after each turn step: let motion blur clear, a fresh
+                                                       # frame.jpg land, AND give the model time to process before
+                                                       # the next burst (0.35 -> 0.7 -> 1.0; was overshooting a step)
+SCAN_SWEEP_GAP = float(env("SCAN_SWEEP_GAP", "5.0"))   # a scan after this long of no scanning starts a NEW sweep:
+                                                       # look at the current view WITHOUT turning first, so the bot
+                                                       # registers where it is before it ever moves
+SCAN_MIN_INTERVAL = float(env("SCAN_MIN_INTERVAL", "3.0"))  # HARD floor between consecutive scan turns. The voice
+                                                       # model fires scans as fast as it gets photos; this paces the
+                                                       # actual turning so it can't outrun itself. Raise to slow scans.
+SCAN_FULL_TURN_STEPS = int(env("SCAN_FULL_TURN_STEPS", "10"))  # ~how many scan steps make a full 360 (no compass, so
+                                                              # we count steps as a crude 'how far around am I' and
+                                                              # tell the model, so it doesn't quit before it's checked
+                                                              # behind itself). Rough; tune on the floor.
 # hybrid vision: on-demand look (crisp) + silent change-gated ambient push (cheap)
 LOOK_MAXDIM = int(env("VISION_LOOK_MAXDIM", "512"))
 LOOK_QUALITY = int(env("VISION_LOOK_QUALITY", "65"))
@@ -118,8 +150,10 @@ INSTRUCTIONS = (
     "ordinary moves or to check those things — you already have them. Call the look tool ONLY when the "
     "user asks what you see or you must actually identify/describe something with your own eyes. "
     "SEARCHING / FINDING: when asked to look around, spin until you see something, or find or identify a "
-    "thing, use the scan tool, NOT drive. Each scan call turns the car a small step to the LEFT or RIGHT "
-    "(you pick) and hands you a fresh photo. Choose the direction on purpose, toward where the thing "
+    "thing, use the scan tool, NOT drive. The FIRST scan just shows you the view from where you already "
+    "are, without moving — look at it first. Each scan AFTER that turns the car a small step to the LEFT "
+    "or RIGHT (you pick) and hands you a fresh photo, so scanning again means 'I've looked, keep going'; "
+    "always read the photo and decide before you scan again. Choose the direction on purpose, toward where the thing "
     "should be: if you just turned right and it was ahead of you, scan left to bring it back; if you last "
     "saw it on one side, scan that way. Look at each photo; if what you're after isn't in it, scan again, "
     "step by step (a full turn is several scans). Getting it CLEARLY in view matters: if it first shows up "
@@ -127,16 +161,27 @@ INSTRUCTIONS = (
     "Keep scanning a small step or two more the same way until it is fully in view and roughly centered, "
     "and only THEN stop scanning and either say what it is or head toward it. Don't take big blind turns to "
     "search. Chain the scans yourself — scan, read the view, decide, scan again — without waiting to be "
-    "prompted. "
+    "prompted. IMPORTANT — don't give up early: a few steps only covers a small arc, and something behind "
+    "you takes about half a full circle of steps to come into view. Keep scanning the SAME direction, step "
+    "by step, until you have gone a FULL circle (the view note tells you the step count and how many make a "
+    "circle) before you ever conclude something isn't there. Finding nothing in the first few steps means "
+    "keep going, NOT stop. "
     "GOING TO SOMETHING (a mission): when asked to find something and go to it, run the whole job yourself "
     "as a loop, speaking only a short update at each stage. First sweep with scan to find it. If a full "
     "sweep turns up nothing, turn toward the most open direction the camera reports and navigate forward a "
     "little to a new spot, then sweep again from there; repeat until you find it. Once it is clearly and "
-    "fully in view (not just a sliver at the edge), turn to put it roughly straight ahead (scan toward it) "
-    "before driving, then navigate toward it, and every so often scan "
-    "again to re-center it as it drifts, since navigate only rolls forward and around obstacles. When you "
-    "get close, use advance so you stop just short of it. Keep the loop going until you've reached it or "
-    "it's clearly not findable — don't stop after one step or wait to be told to keep going."
+    "fully in view (not just a sliver at the edge), scan toward it until it is roughly CENTRED, then call "
+    "lock_on and then go_to: go_to drives to it on its own — keeping it centred, steering around obstacles, "
+    "and stopping just short — so you do NOT steer it there yourself or babysit it. Do NOT use navigate to "
+    "approach a specific target; navigate is only for open-ended 'go that way / explore' with nothing "
+    "particular in mind. If go_to reports it lost sight of the target, scan to find it again, lock_on again, "
+    "then go_to again. Keep the loop going until you've reached it or it's clearly not findable — don't stop "
+    "after one step or wait to be told to keep going. "
+    "THINKING IT THROUGH: if you get genuinely stuck — a full sweep finds nothing, you're boxed into a tight "
+    "space, or reaching a goal needs real multi-step planning around obstacles — call think with a short "
+    "description of the situation and your goal. A stronger reasoning model hands back a short plan; carry it "
+    "out with your normal tools, and tell the user in a few words what you're doing. Use think at real "
+    "decision points, not for routine single moves."
 )
 
 TOOLS = [
@@ -165,11 +210,28 @@ TOOLS = [
      "description": "Attach a fresh photo from the robot's forward camera so you can see the scene with your own eyes. Call before moving toward something or when asked what you see.",
      "parameters": {"type": "object", "properties": {}, "required": []}},
     {"type": "function", "name": "scan",
-     "description": "Turn a small step to the LEFT or RIGHT (you choose) and take a photo — the way to look around for something. Use this whenever asked to spin, turn, or look around until you see, find, or identify something. Each call rotates the car a little the chosen way and hands you a fresh camera view; look at it, and if what you want isn't there, call scan again. Keep calling it to sweep (a full turn is several scans). Pick the direction deliberately, toward where the thing should be: if you just turned right and it was ahead of you, scan left to bring it back; if you last saw it on your left, scan left. The instant you see it, stop scanning and either say what it is or head toward it. Never use big blind turns to search.",
+     "description": "Look around for something, a small step at a time. The FIRST scan of a search hands you the view from where you already are WITHOUT moving — look at it first. Each scan after that turns the car a small step to the LEFT or RIGHT (you choose) and hands you a fresh camera view, so calling scan again means 'I've looked at that view, keep going.' Always read each photo and decide before scanning again; if what you want isn't there, scan once more. Keep calling it to sweep (a full turn is several scans). Pick the direction deliberately, toward where the thing should be: if you just turned right and it was ahead of you, scan left to bring it back; if you last saw it on your left, scan left. The instant you see it clearly, stop scanning and either say what it is or head toward it. Never use big blind turns to search.",
      "parameters": {"type": "object", "properties": {
          "direction": {"type": "string", "enum": ["left", "right"],
                        "description": "which way to turn this step — left or right (default right)"}},
          "required": []}},
+    {"type": "function", "name": "lock_on",
+     "description": "Lock onto the thing you want to drive to, so the robot can track it and home in. Call this ONLY once the target is clearly and fully in view and roughly CENTRED in the frame (scan toward it first until it's centred) — it locks onto whatever is in the middle of the view. After it locks, call go_to. If it says it couldn't lock, centre the target better and try again.",
+     "parameters": {"type": "object", "properties": {
+         "label": {"type": "string", "description": "what you're locking onto, e.g. 'the trash can' (for your own reference)"},
+         "size": {"type": "string", "enum": ["small", "medium", "large"],
+                  "description": "how big the target looks in the frame right now (default medium)"}},
+         "required": ["label"]}},
+    {"type": "function", "name": "go_to",
+     "description": "Drive to the target you locked onto with lock_on: the robot keeps it centred, steers around obstacles by itself, and stops just short when it arrives. Continuous and self-reacting — do NOT babysit it. It reports back when it arrives, or if it loses sight of the target (then scan to find it again and lock_on again). Requires a lock first.",
+     "parameters": {"type": "object", "properties": {
+         "speed": {"type": "number", "description": "0.6..1 (below 0.6 the motors stall), default 1"}},
+         "required": []}},
+    {"type": "function", "name": "think",
+     "description": "Ask a stronger reasoning model for a plan when you're stuck or a task needs real multi-step spatial planning — e.g. you've searched and can't find something, you're boxed into a tight space, or you must work out how to get somewhere around obstacles. Describe the situation and your goal; it hands back a short step-by-step plan that you then carry out with your other tools. Use it at genuine decision points, not for routine single moves.",
+     "parameters": {"type": "object", "properties": {
+         "situation": {"type": "string", "description": "what you're trying to do and why you're stuck or unsure"}},
+         "required": ["situation"]}},
 ]
 
 
@@ -304,16 +366,31 @@ async def guarded_forward(speed, enqueue, steer):
 
             if steer:
                 act, turn_started = avoid.decide(l, c, r, loom, cur, turn_started, now)  # turn, don't stop
+                # sonar backstop: if the camera says "clear ahead" but the front sonar sees something at
+                # the standoff (a blank wall, clear plastic — where monocular depth fails), don't drive
+                # into it; turn toward the more-open side instead (mirrors decide()'s open-side choice)
+                if act == "forward":
+                    ucm, uvalid = read_ultra()
+                    if avoid.ultra_blocked(ucm, uvalid):
+                        act = "ccw" if l <= r else "cw"
+                        turn_started = now
                 spd = speed if act == "forward" else max(0.6, speed)   # 0.6 floor: below it the motors stall
                 motor("%s %.2f" % (act, spd))
                 cur = act
             else:
-                # stop-mode: same 'blocked' test decide() uses, but we STOP instead of turning
+                # stop-mode: stop on the front sonar's true standoff OR the camera/loom block.
+                # sonar and camera are complementary — sonar sees clear/transparent surfaces the
+                # camera looks through; camera sees off-axis things outside the sonar's narrow cone.
+                ucm, uvalid = read_ultra()
+                if avoid.ultra_blocked(ucm, uvalid):
+                    reason = "I'm right up close"       # metric standoff reached
+                    break
                 if (c >= avoid.STOP_NEAR or l >= avoid.SIDE_NEAR
                         or r >= avoid.SIDE_NEAR or loom >= avoid.LOOM_BRAKE):
                     reason = "something's right ahead"
                     break
-                motor("forward %.2f" % speed)          # refresh every loop (keeps the daemon dead-man alive)
+                spd = avoid.approach_speed(ucm, uvalid, speed)   # ease off as we close in (metric taper)
+                motor("forward %.2f" % spd)            # refresh every loop (keeps the daemon dead-man alive)
 
             # bumped/wedged: driving but the view stops changing -> stuck on something depth can't
             # see. stop-mode stops + reports; steer-mode recovers (reverse+turn) and continues.
@@ -358,6 +435,88 @@ async def guarded_forward(speed, enqueue, steer):
     await enqueue({"type": "conversation.item.create", "item": {
         "type": "message", "role": "user",
         "content": [{"type": "input_text", "text": "(camera) stopped moving — %s" % reason}]}})
+    await enqueue({"type": "response.create"})
+
+
+async def guarded_home(speed, enqueue):
+    """Drive to the currently-locked visual target. Keeps it centred with proportional steering on
+    target.bearing, rolls forward through the shared avoidance so it skirts obstacles, and stops on
+    the sonar standoff when it arrives — the same local ~20Hz control as advance/navigate, so the
+    cloud model just says 'go to it' and the box does the visual servoing. Ends (and reports) on:
+    arrival, losing the target too long, no lock, kill switch, time cap, or lost camera."""
+    cancelled = False
+    reason = "I couldn't get to it"
+    start = time.monotonic()
+    lost_since = None
+    try:
+        tg = read_target()
+        if not (tg and tg.get("active")):
+            reason = "I don't have a lock — get it in view and lock onto it first"
+        else:
+            while True:
+                now = time.monotonic()
+                if os.path.exists(DISARM):
+                    reason = "the kill switch is on"; break
+                if now - start > GOTO_MAX_SECS:
+                    reason = "I ran out of time getting to it"; break
+                st = read_nav_state()
+                if st is None:
+                    reason = "I lost the camera feed"; break
+                tg = st.get("target") or {}
+                if not tg.get("active"):
+                    reason = "I lost the lock"; break
+                n = st.get("near", {}) or {}
+                l, c, r = n.get("l", 0), n.get("c", 0), n.get("r", 0)
+                loom = st.get("loom", 0) or 0
+                ucm, uvalid = read_ultra()
+
+                # lost sight: tolerate a brief blip (occlusion / motion blur), then give up so the
+                # model can re-scan and re-lock rather than wander blind
+                if tg.get("lost"):
+                    lost_since = now if lost_since is None else lost_since
+                    if now - lost_since > GOTO_LOST_SECS:
+                        reason = "I lost sight of it"; break
+                    motor("stop")
+                    await asyncio.sleep(0.05); continue
+                lost_since = None
+
+                bearing = tg.get("bearing", 0.0)
+                centered = abs(bearing) < GOTO_BEAR_DEAD
+                # arrived: it's centred AND right in front (sonar standoff, camera block, or it fills
+                # the frame). The centred test is what stops a side wall reading as 'arrived'.
+                if centered and (avoid.ultra_blocked(ucm, uvalid) or c >= avoid.STOP_NEAR
+                                 or tg.get("size", 0) >= GOTO_SIZE_ARRIVE):
+                    reason = "I'm right up next to it"; break
+
+                blocked = (c >= avoid.STOP_NEAR or l >= avoid.SIDE_NEAR
+                           or r >= avoid.SIDE_NEAR or loom >= avoid.LOOM_BRAKE)
+                if blocked and not centered:
+                    # obstacle ahead while the target is off to a side -> skirt toward the more open
+                    # side (shared avoidance decides); homing resumes once past it
+                    act, _ = avoid.decide(l, c, r, loom, None, 0.0, now)
+                    if act in ("cw", "ccw"):
+                        motor("%s %.2f" % (act, max(0.6, avoid.TURN_SPEED)))
+                    else:
+                        motor("forward %.2f" % max(0.6, avoid.approach_speed(ucm, uvalid, speed)))
+                else:
+                    # home: proportional arc — turn toward the target (w), ease forward as it
+                    # centres (vy), and slow on the sonar as we close in
+                    w = max(-GOTO_WMAX, min(GOTO_WMAX, GOTO_KP * bearing))
+                    fwd = avoid.approach_speed(ucm, uvalid, speed)
+                    vy = fwd * max(0.0, 1.0 - abs(bearing) / 0.5)   # face it before charging ahead
+                    motor("raw V 0 %.2f %.2f" % (vy, w))
+                await asyncio.sleep(0.05)
+    except asyncio.CancelledError:
+        cancelled = True
+        raise
+    finally:
+        motor("stop")
+        if not cancelled:
+            clear_goal()                            # terminal end -> drop the lock
+        log("go_to stopped: %s" % ("cancelled" if cancelled else reason))
+    await enqueue({"type": "conversation.item.create", "item": {
+        "type": "message", "role": "user",
+        "content": [{"type": "input_text", "text": "(camera) %s" % reason}]}})
     await enqueue({"type": "response.create"})
 
 
@@ -438,13 +597,127 @@ def read_nav_state():
         return None
 
 
+def read_ultra():
+    """Latest front-sonar reading as (cm, valid). Returns (None, False) if missing/stale, so a
+    dead or silent sonar simply hands the stop decision back to the camera."""
+    try:
+        with open(ULTRA) as f:
+            u = json.load(f)
+        if time.time() - u.get("ts", 0) > ULTRA_FRESH:
+            return None, False
+        return u.get("cm"), bool(u.get("valid"))
+    except Exception:
+        return None, False
+
+
+def seed_goal(label, size="medium"):
+    """Seed perception's target tracker with a CENTRED box. The model centres the target by
+    scanning first, so we don't need pixel coordinates from it (which vision models get wrong) —
+    we just lock the tracker onto whatever is in the middle of the frame right now."""
+    w, h = LOCK_BOX.get(size, LOCK_BOX["medium"])
+    box = [round((1.0 - w) / 2.0, 3), round((1.0 - h) / 2.0, 3), w, h]   # centred [x,y,w,h] normalized
+    tmp = GOAL + ".tmp"
+    try:
+        with open(tmp, "w") as f:
+            json.dump({"seed": box, "label": label or "target"}, f)
+        os.replace(tmp, GOAL)
+        return True
+    except Exception:
+        return False
+
+
+def clear_goal():
+    """Drop the lock -> perception clears its tracker (target goes inactive)."""
+    try:
+        os.remove(GOAL)
+    except FileNotFoundError:
+        pass
+    except Exception:
+        pass
+
+
+def read_target():
+    """Latest tracker target dict (active/bearing/size/lost) or None."""
+    st = read_nav_state()
+    return (st or {}).get("target") if st else None
+
+
+def surroundings_summary():
+    """Compact text picture of what the box senses right now, for the planner to reason over."""
+    st = read_nav_state() or {}
+    if not st:
+        return "no live sensor data"
+    n = st.get("near", {}) or {}
+    ucm, uvalid = read_ultra()
+    tg = st.get("target") or {}
+    where = {"l": "left", "c": "center", "r": "right"}.get(st.get("clearest", "c"), "center")
+    parts = ["closeness (higher=closer; ~%d blocks forward): left=%d center=%d right=%d"
+             % (avoid.STOP_NEAR, n.get("l", 0), n.get("c", 0), n.get("r", 0)),
+             "most open direction: %s" % where]
+    if st.get("boxed_in"):
+        parts.append("BOXED IN — tight on all sides")
+    if uvalid and ucm is not None:
+        parts.append("sonar dead-ahead: %d cm" % round(ucm))
+    elif ucm is None:
+        parts.append("sonar: clear ahead (nothing within ~3.4 m)")
+    if tg.get("active"):
+        parts.append("tracked target " + ("LOST from view" if tg.get("lost")
+                     else "in view (bearing %.2f, -=left/+=right)" % tg.get("bearing", 0.0)))
+    if (st.get("loom", 0) or 0) > LOOM_TEXT:
+        parts.append("something looming closer ahead")
+    return "; ".join(parts)
+
+
+PLANNER_SYSTEM = (
+    "You are the reasoning planner for a small four-wheeled robot car with a forward camera and a "
+    "front-facing ultrasonic sensor. A faster voice model drives the car and calls you when it is "
+    "stuck or a move needs real multi-step spatial planning. Think spatially and hand back a short, "
+    "concrete plan it can execute. The car has NO map, NO compass or odometry, and open-loop motors: "
+    "it cannot turn precise angles or measure distance travelled, so plan in small steps with "
+    "re-checks — never absolute angles or distances. Be concise: a few short numbered steps, no preamble.")
+
+
+def call_planner(situation, summary):
+    """Blocking Claude call (run via to_thread). Returns a short plan string, or None on any failure
+    so the caller falls back to the voice model's own judgement."""
+    try:
+        key = open(PLANNER_KEY_FILE).read().strip()
+    except Exception:
+        return None
+    user = ("Situation / goal: %s\n\nLive surroundings: %s\n\n"
+            "Give a short plan (2-5 numbered steps) using ONLY these actions: scan left/right (turn a "
+            "small step and look), lock_on then go_to (drive to a target that's clearly in view), "
+            "advance (roll up to something and stop), navigate (wander forward around obstacles), drive "
+            "(one small timed nudge), stop. Small steps, re-check as you go." % (situation, summary))
+    body = json.dumps({"model": PLANNER_MODEL, "max_tokens": PLANNER_MAXTOK,
+                       "system": PLANNER_SYSTEM,
+                       "messages": [{"role": "user", "content": user}]}).encode()
+    req = urllib.request.Request("https://api.anthropic.com/v1/messages", data=body, method="POST")
+    req.add_header("x-api-key", key)
+    req.add_header("anthropic-version", "2023-06-01")
+    req.add_header("content-type", "application/json")
+    try:
+        r = urllib.request.urlopen(req, timeout=25)
+        d = json.load(r)
+        text = "".join(b.get("text", "") for b in d.get("content", []) if b.get("type") == "text").strip()
+        return text or None
+    except Exception as e:
+        log("planner error: %s" % type(e).__name__)
+        return None
+
+
 def scene_summary(st):
-    """One short line describing what the camera sees, for near-constant awareness."""
+    """One short line describing what the robot senses, for near-constant awareness."""
     clearest = st.get("clearest", "c")
     loom = st.get("loom", 0) or 0
     tg = st.get("target", {}) or {}
     dirword = {"l": "left", "c": "center", "r": "right"}.get(clearest, "center")
     parts = ["most open %s" % dirword]
+    if st.get("boxed_in"):
+        parts.append("boxed in — tight all around")
+    ucm, uvalid = read_ultra()
+    if uvalid and ucm is not None and ucm < 80:      # only when notably close, to keep the line short
+        parts.append("something ~%d cm dead ahead" % round(ucm))
     if loom > LOOM_TEXT:
         parts.append("something getting closer ahead")
     if tg.get("active"):
@@ -517,6 +790,7 @@ async def main():
         send_q = asyncio.Queue()          # fresh per-connection queue (drops stale events on reconnect)
         last_activity = {"t": 0.0}        # monotonic time of last voice activity; gates ambient pushes
         adv = {"task": None}              # in-flight guarded-advance task, if any
+        scan_st = {"last": 0.0, "steps": 0, "last_turn": 0.0}   # last scan time + steps + last actual-turn time
 
         async def enqueue(evt):
             await send_q.put(evt)
@@ -629,24 +903,52 @@ async def main():
                                 await enqueue(image_item(durl, "Current camera view (look):", LOOK_DETAIL))
                             await enqueue({"type": "response.create"})
                         elif name == "scan":
-                            # search step: turn a small amount locally, let it settle, then hand over a
-                            # fresh photo so the model can recognise the target and decide whether to
-                            # keep scanning. This is what makes "spin until you see X" actually work.
+                            # search step. Registration-before-movement: the FIRST scan of a sweep just
+                            # hands over the CURRENT view without turning, so the model registers where it
+                            # is before the bot ever moves. Each later scan means "I've processed the last
+                            # view, keep going" — so it turns a step, then hands over the new view. This
+                            # gates every move on a registered image and stops it running a step ahead.
                             await cancel_advance()   # scanning owns the motors while it runs
                             side = args_of(arguments).get("direction", "right")
                             if side not in ("left", "right"):
                                 side = "right"
                             turn = "ccw" if side == "left" else "cw"   # left = ccw, right = cw
                             disarmed = os.path.exists(DISARM)
-                            if not disarmed:
+                            now_m = time.monotonic()
+                            fresh_sweep = (now_m - scan_st["last"]) > SCAN_SWEEP_GAP
+                            scan_st["last"] = now_m
+                            if fresh_sweep:
+                                scan_st["steps"] = 0
+                            did_turn = (not disarmed) and (not fresh_sweep)
+                            if did_turn:
+                                # hard pace: don't turn again until SCAN_MIN_INTERVAL since the last turn, so
+                                # the bot can't scan faster than this no matter how fast the model calls
+                                wait = SCAN_MIN_INTERVAL - (now_m - scan_st["last_turn"])
+                                if wait > 0:
+                                    await asyncio.sleep(wait)
+                                scan_st["steps"] += 1
+                                scan_st["last_turn"] = time.monotonic()
                                 motor("%s %.2f %.2f" % (turn, SCAN_TURN_SPEED, SCAN_TURN_SECS))  # timed, self-expiring
                                 await asyncio.sleep(SCAN_TURN_SECS + SCAN_SETTLE)
+                            else:
+                                await asyncio.sleep(SCAN_SETTLE)   # settle for a clean frame even without turning
                             durl = await to_thread(frame_data_url, LOOK_MAXDIM, LOOK_QUALITY)
-                            note = ("kill switch is on — I can't turn, but here's the current view" if disarmed
-                                    else ("turned a step %s; view attached" % side if durl else "camera unavailable"))
-                            await enqueue(func_output(call_id, {"ok": durl is not None, "note": note}))
+                            steps = scan_st["steps"]
+                            if disarmed:
+                                note = "kill switch is on — I can't turn, but here's the current view"
+                                cap = "Current camera view (can't turn — kill switch on):"
+                            elif did_turn:
+                                note = ("turned a step %s (step %d of ~%d for a full circle); decide before "
+                                        "scanning again. If you haven't found it, keep scanning the same way — "
+                                        "you've only covered part of the way around." % (side, steps, SCAN_FULL_TURN_STEPS))
+                                cap = "Camera view after turning a step %s (scan step %d/~%d):" % (side, steps, SCAN_FULL_TURN_STEPS)
+                            else:
+                                note = "here's the view from where I am (start of sweep); scan again to turn a step %s" % side
+                                cap = "Current camera view (start of sweep, not turned yet):"
+                            await enqueue(func_output(call_id, {"ok": durl is not None,
+                                                                "note": note if durl else "camera unavailable"}))
                             if durl:
-                                await enqueue(image_item(durl, "Camera view after turning a step %s (scanning):" % side, LOOK_DETAIL))
+                                await enqueue(image_item(durl, cap, LOOK_DETAIL))
                             await enqueue({"type": "response.create"})
                         elif name in ("advance", "navigate"):
                             # continuous, locally-reactive driving: hand off to a background task.
@@ -660,6 +962,41 @@ async def main():
                             await enqueue(func_output(call_id, {"ok": True, "detail": (
                                 "on my way; steering around obstacles" if steer
                                 else "rolling forward; I'll stop when I'm close to something")}))
+                        elif name == "lock_on":
+                            # seed perception's tracker on the (already-centred) target, then confirm
+                            # it actually latched before telling the model to drive.
+                            a = args_of(arguments)
+                            locked = False
+                            if seed_goal(a.get("label", "target"), a.get("size", "medium")):
+                                for _ in range(24):            # ~1.2s for the tracker to latch
+                                    await asyncio.sleep(0.05)
+                                    tg = read_target()
+                                    if tg and tg.get("active") and not tg.get("lost"):
+                                        locked = True; break
+                            if not locked:
+                                clear_goal()
+                            await enqueue(func_output(call_id, {"ok": locked, "note": (
+                                "locked on — call go_to to drive to it" if locked
+                                else "couldn't lock on; get it centred and try lock_on again")}))
+                            await enqueue({"type": "response.create"})
+                        elif name == "go_to":
+                            # home in on the locked target (background task, like advance/navigate)
+                            await cancel_advance()
+                            spd = _clamp(args_of(arguments).get("speed", 1.0), 0.6, 1.0, 1.0)
+                            adv["task"] = asyncio.create_task(guarded_home(spd, enqueue))
+                            adv["task"].add_done_callback(_log_task_death)
+                            await enqueue(func_output(call_id, {"ok": True,
+                                "detail": "heading to it; I'll keep it centred and stop when I'm there"}))
+                        elif name == "think":
+                            # route a hard spatial decision to the stronger planner (Claude), giving it
+                            # the live surroundings; hand its plan back for the voice model to execute.
+                            sit = args_of(arguments).get("situation", "").strip() or "decide what to do next"
+                            plan = await to_thread(call_planner, sit, surroundings_summary())
+                            note = ("plan:\n" + plan if plan else
+                                    "planner unavailable — use your own judgement: sweep with scan; if boxed "
+                                    "in, head toward the most open direction and re-check as you go")
+                            await enqueue(func_output(call_id, {"ok": plan is not None, "note": note}))
+                            await enqueue({"type": "response.create"})
                         else:
                             await cancel_advance()   # drive/stop preempt a guarded advance
                             result = invoke_tool(name, arguments)
