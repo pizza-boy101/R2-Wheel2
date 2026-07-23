@@ -54,6 +54,10 @@ RESEND = float(env("MOTOR_RESEND", "0.04"))       # loop/resend cadence (< firmw
 DEADMAN = float(env("MOTOR_DEADMAN", "0.5"))      # sustained cmd auto-stops if not refreshed within this
 ULTRA_MIN_WRITE = float(env("ULTRA_MIN_WRITE", "0"))   # publish every reading (firmware caps at ~20Hz;
                                                        # the write is tiny, so no throttle needed)
+ULTRA_MEDIAN = int(env("ULTRA_MEDIAN", "3"))      # median window over recent pings: rejects a single
+                                                  # spurious short/dropped echo (HC-SR04s glitch off soft or
+                                                  # angled surfaces) so one bad frame can't fake a close stop
+ULTRA_FAR = 999.0                                 # sentinel 'far' for an invalid ping, so the median is numeric
 BAUD = 115200
 
 # direction -> (vx, vy, w) unit velocity, matching the `move` script + firmware V protocol
@@ -141,7 +145,8 @@ def main():
     deadline = 0.0                                 # stop when now passes this
     was_disarmed = False
     rbuf = b""                                      # inbound serial accumulator (for "U <cm>" lines)
-    ultra_pending = None                           # latest parsed (cm, valid), written throttled
+    ultra_pending = None                           # latest FILTERED (cm, valid), written throttled
+    ultra_ring = []                                # recent pings (cm floats; invalid -> ULTRA_FAR) for the median
     last_ultra_write = 0.0
     w("S")                                         # start stopped
 
@@ -207,7 +212,13 @@ def main():
                                 cm = float(line[2:].strip())
                             except Exception:
                                 continue
-                            ultra_pending = (None, False) if cm < 0 else (round(cm, 1), True)
+                            # median-of-N to reject single-frame glitches (see ULTRA_MEDIAN). Invalid
+                            # pings map to ULTRA_FAR so a lone dropped echo can't fake "far" either.
+                            ultra_ring.append(ULTRA_FAR if cm < 0 else round(cm, 1))
+                            if len(ultra_ring) > ULTRA_MEDIAN:
+                                del ultra_ring[:-ULTRA_MEDIAN]
+                            med = sorted(ultra_ring)[len(ultra_ring) // 2]
+                            ultra_pending = (None, False) if med >= ULTRA_FAR else (med, True)
                     if len(rbuf) > 512:               # runaway guard (no newline arriving)
                         rbuf = rbuf[-128:]
         except Exception:

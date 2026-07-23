@@ -58,6 +58,12 @@ RATE = 24000
 PLANNER_KEY_FILE = env("ANTHROPIC_KEY_FILE", os.path.join(HOME, "robot", "secrets", "anthropic.key"))
 PLANNER_MODEL = env("PLANNER_MODEL", "claude-opus-4-8")
 PLANNER_MAXTOK = int(env("PLANNER_MAXTOK", "512"))
+PLANNER_TIMEOUT = float(env("PLANNER_TIMEOUT", "8"))    # give up on the planner after this; the voice model
+                                                        # then falls back to its own judgement. Kept short so a
+                                                        # stalled call over flaky Wi-Fi can't leave the car
+                                                        # deaf/mute waiting (motors already dead-man in 0.5 s)
+THINK_COOLDOWN = float(env("THINK_COOLDOWN", "8"))      # don't re-plan within this of the last plan; carry the
+                                                        # last one out first (stops the model spamming the planner)
 WORKSPACE = env("ROBOT_WORKSPACE", os.path.join(HOME, "robot", "workspace"))
 MOVE = os.path.join(WORKSPACE, "move")
 DISARM = os.path.join(WORKSPACE, ".disarmed")       # kill switch flag (move disarm)
@@ -77,6 +83,9 @@ MAX_RECOVER = int(env("ADVANCE_MAX_RECOVER", "3"))           # give up (report w
 ADVANCE_MOTION_MIN = float(env("ADVANCE_MOTION_MIN", "5.0"))  # smoothed scene-motion below this = not moving
 ADVANCE_STALL_SECS = float(env("ADVANCE_STALL_SECS", "0.6"))  # ...for this long while driving = wedged
 ULTRA_FRESH = float(env("ULTRA_FRESH", "0.5"))                # ignore sonar readings older than this (fall back to camera)
+NAV_FRESH = float(env("NAV_FRESH", "0.6"))                   # treat perception's nav_state as dead past this, so a
+                                                             # frozen depth frame (perception stalled/crashed) halts the
+                                                             # drive loops instead of steering blind on a stale picture
 # go_to (drive to a locked visual target): steer to keep it centred, skirt obstacles, stop on the sonar.
 GOTO_MAX_SECS = float(env("GOTO_MAX_SECS", "30"))             # safety cap on one homing run
 GOTO_LOST_SECS = float(env("GOTO_LOST_SECS", "1.2"))          # tracker 'lost' this long -> give up, ask to re-find
@@ -590,7 +599,7 @@ def read_nav_state():
     try:
         with open(NAV_STATE) as f:
             st = json.load(f)
-        if time.time() - st.get("ts", 0) > 1.0:
+        if time.time() - st.get("ts", 0) > NAV_FRESH:
             return None
         return st
     except Exception:
@@ -677,18 +686,25 @@ PLANNER_SYSTEM = (
     "re-checks — never absolute angles or distances. Be concise: a few short numbered steps, no preamble.")
 
 
-def call_planner(situation, summary):
+def call_planner(situation, summary, history=None):
     """Blocking Claude call (run via to_thread). Returns a short plan string, or None on any failure
-    so the caller falls back to the voice model's own judgement."""
+    so the caller falls back to the voice model's own judgement. `history` = the recent plans this
+    attempt so the planner can BUILD ON them (or change tack) instead of handing back the same plan."""
     try:
         key = open(PLANNER_KEY_FILE).read().strip()
     except Exception:
         return None
-    user = ("Situation / goal: %s\n\nLive surroundings: %s\n\n"
+    prior = ""
+    if history:
+        prior = ("\n\nEarlier this attempt (these did NOT get it unstuck — build on them or try a "
+                 "different tack, don't just repeat):\n" + "\n".join(
+                     "- for \"%s\": %s" % (h["situation"], " ".join(h["plan"].split())[:200])
+                     for h in history))
+    user = ("Situation / goal: %s\n\nLive surroundings: %s%s\n\n"
             "Give a short plan (2-5 numbered steps) using ONLY these actions: scan left/right (turn a "
             "small step and look), lock_on then go_to (drive to a target that's clearly in view), "
             "advance (roll up to something and stop), navigate (wander forward around obstacles), drive "
-            "(one small timed nudge), stop. Small steps, re-check as you go." % (situation, summary))
+            "(one small timed nudge), stop. Small steps, re-check as you go." % (situation, summary, prior))
     body = json.dumps({"model": PLANNER_MODEL, "max_tokens": PLANNER_MAXTOK,
                        "system": PLANNER_SYSTEM,
                        "messages": [{"role": "user", "content": user}]}).encode()
@@ -697,7 +713,7 @@ def call_planner(situation, summary):
     req.add_header("anthropic-version", "2023-06-01")
     req.add_header("content-type", "application/json")
     try:
-        r = urllib.request.urlopen(req, timeout=25)
+        r = urllib.request.urlopen(req, timeout=PLANNER_TIMEOUT)
         d = json.load(r)
         text = "".join(b.get("text", "") for b in d.get("content", []) if b.get("type") == "text").strip()
         return text or None
@@ -791,6 +807,7 @@ async def main():
         last_activity = {"t": 0.0}        # monotonic time of last voice activity; gates ambient pushes
         adv = {"task": None}              # in-flight guarded-advance task, if any
         scan_st = {"last": 0.0, "steps": 0, "last_turn": 0.0}   # last scan time + steps + last actual-turn time
+        think_st = {"last": 0.0, "history": []}                 # last plan time + recent plans (planner memory)
 
         async def enqueue(evt):
             await send_q.put(evt)
@@ -989,14 +1006,30 @@ async def main():
                                 "detail": "heading to it; I'll keep it centred and stop when I'm there"}))
                         elif name == "think":
                             # route a hard spatial decision to the stronger planner (Claude), giving it
-                            # the live surroundings; hand its plan back for the voice model to execute.
+                            # the live surroundings AND the recent plans this attempt so it iterates
+                            # instead of repeating itself; hand its plan back for the voice model to run.
                             sit = args_of(arguments).get("situation", "").strip() or "decide what to do next"
-                            plan = await to_thread(call_planner, sit, surroundings_summary())
-                            note = ("plan:\n" + plan if plan else
-                                    "planner unavailable — use your own judgement: sweep with scan; if boxed "
-                                    "in, head toward the most open direction and re-check as you go")
-                            await enqueue(func_output(call_id, {"ok": plan is not None, "note": note}))
-                            await enqueue({"type": "response.create"})
+                            now_t = time.monotonic()
+                            since = now_t - think_st["last"]
+                            if since < THINK_COOLDOWN and think_st["history"]:
+                                # just planned -> don't burn another call; carry the last plan out first
+                                last = think_st["history"][-1]["plan"]
+                                await enqueue(func_output(call_id, {"ok": True,
+                                    "note": ("you planned %ds ago — carry this out and re-check before thinking "
+                                             "again:\n%s" % (int(since), last))}))
+                                await enqueue({"type": "response.create"})
+                            else:
+                                think_st["last"] = now_t
+                                plan = await to_thread(call_planner, sit, surroundings_summary(),
+                                                       think_st["history"])
+                                if plan:
+                                    think_st["history"].append({"situation": sit, "plan": plan})
+                                    think_st["history"] = think_st["history"][-2:]   # keep the last couple
+                                note = ("plan:\n" + plan if plan else
+                                        "planner unavailable — use your own judgement: sweep with scan; if boxed "
+                                        "in, head toward the most open direction and re-check as you go")
+                                await enqueue(func_output(call_id, {"ok": plan is not None, "note": note}))
+                                await enqueue({"type": "response.create"})
                         else:
                             await cancel_advance()   # drive/stop preempt a guarded advance
                             result = invoke_tool(name, arguments)

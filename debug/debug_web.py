@@ -13,6 +13,7 @@ which forwards a typed message to the voice sidecar's live session over a unix s
 It still never drives the motors directly. DISARM is one-tap (safe direction) and Esc
 is an emergency stop; ARM asks for confirmation first. Stdlib only (http.server)."""
 import os
+import glob
 import json
 import time
 import socket
@@ -35,30 +36,104 @@ LOGS = {"voice": os.path.join(ROBOT, "realtime.log"),
 PORT = int(os.environ.get("DEBUG_WEB_PORT", "8099"))
 CHAT_SOCK = os.path.join(WORKSPACE, "chat.sock")   # typed messages -> voice sidecar's live session
 _chatsock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+MOTOR_SOCK = os.path.join(WORKSPACE, "motor.sock") # manual d-pad nudges -> motor daemon (it enforces DISARM)
+_motorsock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+BATTERY = os.path.join(WORKSPACE, "battery.json")  # optional pack-voltage telemetry (shown only if present)
+NUDGE_SPEED = float(os.environ.get("DEBUG_NUDGE_SPEED", "0.5"))   # manual-drive nudge speed
+NUDGE_SECS = float(os.environ.get("DEBUG_NUDGE_SECS", "0.4"))     # ...and how long each press drives for
+# d-pad label -> motor-daemon direction. left/right = strafe (mecanum), cw/ccw = rotate.
+DRIVE_DIRS = {"forward": "forward", "back": "back", "cw": "cw", "ccw": "ccw",
+              "strafe_left": "left", "strafe_right": "right"}
 
-# voice runs as a systemd --user service; the dashboard starts/stops it on request.
-VOICE_UNIT = "robocar-voice"
+# The robot's pieces each run as a systemd --user service; the dashboard reports their health and
+# can start/stop the voice one. Keys are the short names shown in the health strip.
+UNITS = {"motor": "robocar-motor", "perception": "robocar-perception",
+         "nav": "robocar-nav", "voice": "robocar-voice", "debug": "robocar-debug"}
+VOICE_UNIT = UNITS["voice"]
 _UID = os.getuid()
 SYSTEMD_ENV = {**os.environ,
                "XDG_RUNTIME_DIR": "/run/user/%d" % _UID,
                "DBUS_SESSION_BUS_ADDRESS": "unix:path=/run/user/%d/bus" % _UID}
-_voice_cache = {"t": 0.0, "on": False}             # cache is-active; don't spawn systemctl every poll
+_units_cache = {"t": 0.0, "st": {}}                # cache is-active for all units; don't spawn systemctl per poll
+
+
+def units_active():
+    """{short_name: bool} liveness for every service, in ONE systemctl call. Cached ~2s so the
+    frequent polls stay cheap."""
+    now = time.time()
+    if now - _units_cache["t"] < 2.0:
+        return _units_cache["st"]
+    st = {}
+    try:
+        r = subprocess.run(["systemctl", "--user", "is-active", *UNITS.values()],
+                           env=SYSTEMD_ENV, capture_output=True, text=True, timeout=4)
+        lines = r.stdout.strip().split("\n")
+        for (name, _unit), line in zip(UNITS.items(), lines):
+            st[name] = (line.strip() == "active")
+    except Exception:
+        st = {}
+    _units_cache.update(t=now, st=st)
+    return st
 
 
 def voice_on():
-    """Whether the voice service is active. Cached ~1.5s so the 300ms /state poll stays cheap."""
-    now = time.time()
-    if now - _voice_cache["t"] < 1.5:
-        return _voice_cache["on"]
-    on = False
+    """Whether the voice service is active (from the shared units cache)."""
+    return bool(units_active().get("voice", False))
+
+
+def _ts_age(path):
+    """Seconds since the `ts` INSIDE a json state file (nav_state / ultrasonic carry their own)."""
     try:
-        r = subprocess.run(["systemctl", "--user", "is-active", VOICE_UNIT],
-                           env=SYSTEMD_ENV, capture_output=True, text=True, timeout=4)
-        on = (r.stdout.strip() == "active")
+        with open(path) as f:
+            return round(time.time() - json.load(f).get("ts", 0), 1)
     except Exception:
-        on = False
-    _voice_cache.update(t=now, on=on)
-    return on
+        return None
+
+
+def _mtime_age(path):
+    """Seconds since a file was last written (used for frame.jpg, which has no internal ts)."""
+    try:
+        return round(time.time() - os.path.getmtime(path), 1)
+    except Exception:
+        return None
+
+
+def read_temp_c():
+    """Hottest on-board thermal zone in °C (Jetson exposes several), or None. Flags throttling."""
+    hi = None
+    for z in glob.glob("/sys/class/thermal/thermal_zone*/temp"):
+        try:
+            v = int(open(z).read().strip()) / 1000.0
+            if 0 < v < 200 and (hi is None or v > hi):
+                hi = v
+        except Exception:
+            pass
+    return round(hi, 1) if hi is not None else None
+
+
+def read_battery():
+    """Optional pack telemetry, e.g. {"v": 11.8}. None unless something is writing battery.json
+    (a future firmware voltage divider); the strip just hides the chip when it's absent."""
+    try:
+        with open(BATTERY) as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def health():
+    """One glance at whether everything's alive: services, sensor freshness, temp, load, battery."""
+    try:
+        load = round(os.getloadavg()[0], 2)
+    except Exception:
+        load = None
+    return {"units": units_active(),
+            "frame_age": _mtime_age(FRAME),
+            "nav_age": _ts_age(NAV_STATE),
+            "sonar_age": _ts_age(ULTRA),
+            "temp_c": read_temp_c(),
+            "load": load,
+            "battery": read_battery()}
 
 PAGE = """<!doctype html><html><head><meta charset=utf-8>
 <meta name=viewport content="width=device-width,initial-scale=1">
@@ -102,6 +177,14 @@ pre{background:#010409;border:1px solid #30363d;border-radius:6px;padding:8px;he
 #chatform{display:flex;gap:6px}
 #chatinput{flex:1;background:#0d1117;border:1px solid #30363d;border-radius:6px;color:#c9d1d9;padding:7px 9px;font:inherit}
 #chatform button{background:#238636;border:none;border-radius:6px;color:#fff;padding:7px 16px;cursor:pointer;font:inherit;font-weight:700}
+.health{display:flex;gap:6px;padding:6px 12px;background:#0f141b;border-bottom:1px solid #30363d;flex-wrap:wrap;align-items:center}
+.chip{padding:2px 8px;border-radius:6px;background:#21262d;color:#8b949e;border:1px solid #30363d;font-size:11px;white-space:nowrap}
+.chip.up{color:#7ee2a8;border-color:#1e3a2a}.chip.down{color:#ff9a9a;border-color:#5a1e1e}.chip.warn{color:#e3b341;border-color:#5a4a1e}
+.pad{display:flex;flex-direction:column;align-items:center;gap:6px}
+.padrow{display:flex;gap:6px}
+.dbtn{width:54px;height:40px;font-size:16px;border-radius:8px;border:1px solid #30363d;background:#21262d;color:#c9d1d9;cursor:pointer;font:inherit;-webkit-user-select:none;user-select:none;touch-action:manipulation}
+.dbtn:active{background:#1f6feb;color:#fff}
+.dbtn.stopb{background:#3a1e1e;border-color:#5a1e1e;color:#ff9a9a}.dbtn.stopb:active{background:#f85149;color:#fff}
 </style></head><body>
 <header>
   <h1>robocar debug</h1>
@@ -114,9 +197,26 @@ pre{background:#010409;border:1px solid #30363d;border-radius:6px;padding:8px;he
   <span id=fps style=color:#8b949e>–</span>
   <span id=conn style=color:#8b949e>connecting…</span>
 </header>
+<div id=health class=health><span class=chip>health…</span></div>
 <div class=wrap>
   <div class=col>
     <div class=card><h2>camera</h2><img id=cam src="/frame.jpg" alt="camera"></div>
+    <div class=card><h2>manual drive (armed only · each press = a short nudge)</h2>
+      <div class=pad>
+        <button class=dbtn data-d=forward title="forward (↑)">▲</button>
+        <div class=padrow>
+          <button class=dbtn data-d=strafe_left title="strafe left (←)">◀</button>
+          <button class="dbtn stopb" data-d=stop title="stop (space)">■</button>
+          <button class=dbtn data-d=strafe_right title="strafe right (→)">▶</button>
+        </div>
+        <button class=dbtn data-d=back title="back (↓)">▼</button>
+        <div class=padrow>
+          <button class=dbtn data-d=ccw title="rotate left (A)">↺</button>
+          <button class=dbtn data-d=cw title="rotate right (D)">↻</button>
+        </div>
+      </div>
+      <div class=hint>arrows = move · A / D = rotate · space = stop · Esc = e-stop</div>
+    </div>
   </div>
   <div class=col>
     <div class=card><h2>nearness (higher = closer; red = blocked)</h2>
@@ -241,7 +341,34 @@ document.getElementById("chatform").addEventListener("submit",function(e){
   }).catch(function(){});
 });
 setInterval(pollChat,1200);
-poll();tail();pollChat();
+// ---- manual drive: d-pad buttons + arrow/WASD keys -> short nudges (daemon auto-stops + enforces arm) ----
+function drive(d){fetch("/drive",{method:"POST",headers:{"Content-Type":"text/plain"},body:d}).catch(function(){});}
+document.querySelectorAll(".dbtn").forEach(function(b){b.onclick=function(){drive(b.dataset.d);};});
+document.addEventListener("keydown",function(e){
+  if(e.target&&(e.target.tagName==="INPUT"||e.target.tagName==="TEXTAREA"))return;   // don't hijack the chat box
+  if(e.key===" "){e.preventDefault();drive("stop");return;}
+  var m={ArrowUp:"forward",ArrowDown:"back",ArrowLeft:"strafe_left",ArrowRight:"strafe_right",
+         a:"ccw",A:"ccw",d:"cw",D:"cw"};
+  if(m[e.key]){e.preventDefault();drive(m[e.key]);}
+});
+// ---- health strip: services up/down, sensor freshness, temp, load, (optional) battery ----
+function chip(host,label,cls){var s=document.createElement("span");s.className="chip "+(cls||"");s.textContent=label;host.appendChild(s);}
+function ageChip(host,name,age,warn,bad){
+  if(age===null||age===undefined){chip(host,name+" —");return;}
+  chip(host,name+" "+age+"s",age>bad?"down":(age>warn?"warn":"up"));}
+function pollHealth(){fetch("/health").then(r=>r.json()).then(function(h){
+  var el=document.getElementById("health");el.innerHTML="";
+  var u=h.units||{};
+  ["motor","perception","nav","voice","debug"].forEach(function(k){
+    if(u[k]===undefined){chip(el,k+" ?");}else{chip(el,k+(u[k]?" ✓":" ✗"),u[k]?"up":"down");}});
+  ageChip(el,"cam",h.frame_age,1,3);ageChip(el,"depth",h.nav_age,1,3);ageChip(el,"sonar",h.sonar_age,2,5);
+  if(h.temp_c!==null&&h.temp_c!==undefined)chip(el,h.temp_c+"°C",h.temp_c>80?"down":(h.temp_c>70?"warn":"up"));
+  if(h.load!==null&&h.load!==undefined)chip(el,"load "+h.load);
+  if(h.battery&&h.battery.v!==undefined&&h.battery.v!==null)
+    chip(el,(+h.battery.v).toFixed(1)+"V",h.battery.v<10.5?"down":(h.battery.v<11.2?"warn":"up"));
+}).catch(function(){});}
+setInterval(pollHealth,2000);
+poll();tail();pollChat();pollHealth();
 </script></body></html>"""
 
 
@@ -309,6 +436,8 @@ class H(BaseHTTPRequestHandler):
                     st["sonar"] = None
                 st["voice"] = "on" if voice_on() else "off"
                 self._send(200, "application/json", json.dumps(st).encode())
+            elif u.path == "/health":
+                self._send(200, "application/json", json.dumps(health()).encode())
             elif u.path == "/frame.jpg":
                 try:
                     with open(FRAME, "rb") as f:
@@ -365,9 +494,28 @@ class H(BaseHTTPRequestHandler):
                     ok = (r.returncode == 0)
                 except Exception:
                     ok = False
-                _voice_cache["t"] = 0.0             # force a fresh is-active read below
+                _units_cache["t"] = 0.0            # force a fresh is-active read below
                 self._send(200, "application/json",
                            json.dumps({"ok": ok, "voice": "on" if voice_on() else "off"}).encode())
+            elif u.path == "/drive":
+                # manual nudge from the dashboard d-pad -> the motor daemon as a self-expiring timed
+                # move (auto-stops after NUDGE_SECS via the daemon's dead-man). The daemon still
+                # enforces DISARM, so this can't move the car when the kill switch is on.
+                d = body.decode("utf-8", "ignore").strip().lower()
+                ok = False
+                if d == "stop":
+                    msg = "stop"
+                elif d in DRIVE_DIRS:
+                    msg = "%s %.2f %.2f" % (DRIVE_DIRS[d], NUDGE_SPEED, NUDGE_SECS)
+                else:
+                    msg = None
+                if msg is not None:
+                    try:
+                        _motorsock.sendto(msg.encode(), MOTOR_SOCK)
+                        ok = True
+                    except Exception:
+                        ok = False                  # motor daemon not running / socket absent
+                self._send(200, "application/json", json.dumps({"ok": ok}).encode())
             elif u.path == "/chat":
                 text = body.decode("utf-8", "ignore").strip()
                 ok = False

@@ -135,11 +135,15 @@ that work to a background thread fixed it.
 
 Debugging a headless robot over SSH by squinting at log files got old fast, so I wrote a tiny
 web dashboard (debug/debug_web.py) that I open in a browser on my laptop. It shows the live
-camera frame, the left/middle/right closeness bars, whether it's armed, and a running tail of
-each log, plus an arm/disarm button and an escape-key kill switch. There's also a little chat
-box on the page: I can type to the robot when saying things out loud isn't practical, and its
-replies show up there. Apart from the switch and the chat it's read-only, and it's plain
-Python with no extra dependencies, so it just runs.
+camera frame, the left/middle/right closeness bars, the front distance in centimetres, whether
+it's armed, and a running tail of each log, plus an arm/disarm button and an escape-key kill
+switch. Across the top there's a health strip that tells me at a glance whether each of the
+robot's programs is actually running, how fresh the camera / depth / distance readings are, and
+how hot the board is getting — which turns "why isn't it reacting" from an SSH archaeology dig
+into a look. There's a little d-pad too, so I can nudge it around with the arrow keys when I
+just want to reposition it by hand, and a chat box for typing to it when saying things out loud
+isn't practical (its replies show up there). It's plain Python with no extra dependencies, so
+it just runs.
 
 ## Stuff that went wrong
 
