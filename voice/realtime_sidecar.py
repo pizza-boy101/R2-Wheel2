@@ -146,8 +146,10 @@ INSTRUCTIONS = (
     "they want it to travel or make its way somewhere (e.g. 'go forward', 'head over there', 'make your way to "
     "the kitchen', 'explore'), call navigate — it rolls forward and steers around obstacles on its own, going "
     "around things instead of stopping. Both react on their own and are continuous, so never re-issue forward "
-    "bursts or babysit them. Use the drive tool with direction forward ONLY for a tiny deliberate nudge. For "
-    "turning and strafing, use the drive tool with a direction, "
+    "bursts or babysit them. Use the drive tool with direction forward ONLY for a tiny deliberate nudge. To "
+    "TURN the car left or right in place use turn_left / turn_right; only slide sideways (strafe_left / "
+    "strafe_right) when the user actually asks to move sideways, not when they say 'turn'. Give the drive tool "
+    "a direction, "
     "a speed from 0.6 to 1.0 (NEVER below 0.6 — below that the motors just stall and buzz and the car "
     "won't move; default to full speed 1.0 unless the user asks to go slower), and a short duration "
     "in seconds — prefer brief bursts (0.5 to 1.5 s) and re-check rather than long "
@@ -197,8 +199,9 @@ TOOLS = [
     {"type": "function", "name": "drive",
      "description": "Drive/turn the car in one direction. Runs in the background (non-blocking) for the given duration; you stay aware while it moves. Any new drive replaces the current motion, and stop halts it early.",
      "parameters": {"type": "object", "properties": {
-         "direction": {"type": "string", "enum": ["forward", "back", "left", "right", "cw", "ccw"],
-                       "description": "forward/back, left/right = strafe, cw/ccw = rotate in place"},
+         "direction": {"type": "string",
+                       "enum": ["forward", "back", "turn_left", "turn_right", "strafe_left", "strafe_right"],
+                       "description": "forward/back; turn_left/turn_right ROTATE in place (this is what 'turn left/right' means); strafe_left/strafe_right slide sideways WITHOUT turning"},
          "speed": {"type": "number", "description": "0.6..1 (below 0.6 the motors stall and the car won't move), default 1"},
          "seconds": {"type": "number", "description": "burst length, keep <= 2"}},
          "required": ["direction"]}},
@@ -314,14 +317,26 @@ def args_of(args_json):
         return {}
 
 
+# model-facing drive direction -> motor-daemon command. Turning is named turn_left/turn_right
+# (what users actually say); the daemon rotates via cw/ccw and strafes via left/right, so "turn
+# left" no longer collides with the sideways strafe. Raw daemon names stay accepted as a fallback.
+DRIVE_MAP = {"forward": "forward", "back": "back",
+             "turn_left": "ccw", "turn_right": "cw",
+             "strafe_left": "left", "strafe_right": "right",
+             "ccw": "ccw", "cw": "cw", "left": "left", "right": "right"}
+
+
 def invoke_tool(name, args_json):
     args = args_of(args_json)
     try:
         if name == "drive":
-            d = args.get("direction", "forward")
+            d = str(args.get("direction", "forward")).lower()
+            cmd = DRIVE_MAP.get(d)
+            if cmd is None:
+                return {"ok": False, "error": "unknown direction %s" % d}
             spd = _clamp(args.get("speed", 1.0), 0.6, 1.0, 1.0)   # 0.6 floor: below this the motors stall/buzz
             secs = _clamp(args.get("seconds", 1.0), 0.1, 2.0, 1.0)
-            motor("%s %.2f %.2f" % (d, spd, secs))   # timed move: the daemon drives for secs then stops
+            motor("%s %.2f %.2f" % (cmd, spd, secs))   # timed move: the daemon drives for secs then stops
             return {"ok": True, "detail": "driving %s at %.2f for %.1fs" % (d, spd, secs)}
         if name == "stop":
             motor("stop")
