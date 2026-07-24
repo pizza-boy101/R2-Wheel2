@@ -97,9 +97,8 @@ NAV_FRESH = float(env("NAV_FRESH", "0.6"))                   # treat perception'
 # go_to (drive to a locked visual target): steer to keep it centred, skirt obstacles, stop on the sonar.
 GOTO_MAX_SECS = float(env("GOTO_MAX_SECS", "45"))             # safety cap on one homing run (Claude-per-step is slower)
 GOTO_LOST_SECS = float(env("GOTO_LOST_SECS", "1.2"))          # tracker 'lost' this long -> give up, ask to re-find
-GOTO_BEAR_DEAD = float(env("GOTO_BEAR_DEAD", "0.10"))         # |bearing| under this = centred enough (up close)
-GOTO_BEAR_DEAD_FAR = float(env("GOTO_BEAR_DEAD_FAR", "0.15"))  # extra centring slack when the thing is far/small:
-                                                             # 'roughly aimed' is fine at distance, precise up close
+GOTO_BEAR_DEAD = float(env("GOTO_BEAR_DEAD", "0.12"))         # |bearing| under this = lined up enough to drive; beyond
+                                                             # it, TURN TO FACE the thing first (near OR far)
 GOTO_BLIND_STEPS = int(env("GOTO_BLIND_STEPS", "6"))         # keep committing toward the last-seen spot for this many
                                                              # not-found looks before giving up — a small/far object
                                                              # blinks in and out of Claude's view, so don't quit on a miss
@@ -222,17 +221,17 @@ INSTRUCTIONS = (
     "by step, until you have gone a FULL circle (the view note tells you the step count and how many make a "
     "circle) before you ever conclude something isn't there. Finding nothing in the first few steps means "
     "keep going, NOT stop. "
-    "GOING TO SOMETHING (a mission): when asked to find and go to a NAMED thing, run the whole job yourself "
-    "as a loop, speaking only a short update at each stage. Hold still and call find_it with what you want "
-    "(e.g. 'a red mug') — a sharper eye finds it wherever it is in view and locks on; you do NOT need to "
-    "centre it first. If find_it locks on, call go_to and you're done driving — go_to reaches it on its own, "
-    "keeping it centred, steering around obstacles, and stopping just short, so you do NOT steer it there or "
-    "babysit it. If find_it says it can't see the thing, sweep ONE scan 'step' to show it a new part of the "
-    "room and call find_it again; keep going around, and if a full circle turns up nothing, navigate a little "
-    "to a new spot and sweep-and-find_it again. Do NOT use navigate to approach a specific target; navigate "
-    "is only for open-ended 'go that way / explore'. If go_to reports it lost sight of the target, just call "
-    "find_it again to re-find it, then go_to. Keep the loop going until you've reached it or it's clearly not "
-    "findable — don't stop after one step or wait to be told to keep going. "
+    "GOING TO SOMETHING (a mission): when asked to find and go to a NAMED thing, the job is basically two "
+    "tools: find_it, then go_to. Hold still and call find_it with what you want (e.g. 'a red ball'). It uses "
+    "a sharper eye that finds the thing WHEREVER it is in view and locks on — you do NOT need to face, centre, "
+    "or judge how far away it is yourself; do not decide the thing is close or lined up from your own sense of "
+    "the scene. If find_it locks on, call go_to and then STOP acting: go_to turns to face the thing and drives "
+    "all the way to it on its own, and calling any other tool (scan, look, find_it, drive) while it runs "
+    "CANCELS it and wrecks the approach. Just wait for its update. If find_it says it can't see the thing, "
+    "sweep ONE scan 'step' to show it a new part of the room and call find_it again; keep going around, and if "
+    "a full circle turns up nothing, navigate a little to a new spot and sweep-and-find_it again. Do NOT use "
+    "navigate to approach a specific target. If go_to reports it lost the thing, call find_it again, then "
+    "go_to. Keep the loop going until you've reached it or it's clearly not findable. "
     "THINKING IT THROUGH: if you get genuinely stuck — a full sweep finds nothing, you're boxed into a tight "
     "space, or reaching a goal needs real multi-step planning around obstacles — call think with a short "
     "description of the situation and your goal. A stronger reasoning model hands back a short plan; carry it "
@@ -287,7 +286,7 @@ TOOLS = [
                   "description": "how big the target looks in the frame right now (default medium)"}},
          "required": ["label"]}},
     {"type": "function", "name": "go_to",
-     "description": "Drive to the thing you locked onto (with find_it or lock_on): the robot keeps it centred, steers around obstacles by itself, and stops just short when it arrives. It also RE-FINDS the thing on its own if the lock slips mid-drive (a sharper eye re-checks in the background), so a brief loss won't derail it. Continuous and self-reacting — do NOT babysit it. It reports back when it arrives, or only if it truly can't re-find the thing (then call find_it). Requires a lock first.",
+     "description": "Drive to the thing you locked onto with find_it. It does EVERYTHING itself: turns to face the thing (even if it's off to one side or far away — you do NOT need to face or centre it first), drives to it, steers around obstacles, re-checks with a sharper eye as it closes in, and stops just short when it arrives. CRITICAL: once you call go_to, WAIT — do not call scan, look, find_it, drive, or any other tool until it reports back. Any of those CANCELS the drive and it starts flailing. It self-reports when it arrives, or only if it truly loses the thing (then call find_it again). Requires a find_it lock first.",
      "parameters": {"type": "object", "properties": {
          "speed": {"type": "number", "description": "0.6..1 (below 0.6 the motors stall), default 1"}},
          "required": []}},
@@ -560,10 +559,9 @@ async def guarded_home(speed, enqueue):
                     bearing = (box[0] + box[2] / 2.0) - 0.5   # Claude's pixel bearing: - = left, + = right
                     size = box[2] * box[3]
                     last_bearing = bearing
-                    # looser 'centred' when it's far/small (just aim roughly and drive at it), tightening to
-                    # GOTO_BEAR_DEAD as it fills the frame -> precise only when it matters, up close
-                    dead = GOTO_BEAR_DEAD + GOTO_BEAR_DEAD_FAR * (1.0 - min(1.0, size / GOTO_SIZE_ARRIVE))
-                    centered = abs(bearing) < dead
+                    # turn to FACE it whenever it's off to a side — near OR far. Only drive forward once it's
+                    # lined up ahead. (The proportional turn below is tiny near centre, so no wiggle.)
+                    centered = abs(bearing) < GOTO_BEAR_DEAD
                     if centered and (avoid.ultra_blocked(ucm, uvalid) or c >= avoid.STOP_NEAR
                                      or size >= GOTO_SIZE_ARRIVE):
                         reason = "I'm right up next to it"; break
@@ -577,7 +575,7 @@ async def guarded_home(speed, enqueue):
                     if fails >= GOTO_BLIND_STEPS:
                         reason = "I lost it and couldn't re-find it"; break
                     bearing = last_bearing
-                    centered = abs(bearing) < (GOTO_BEAR_DEAD + GOTO_BEAR_DEAD_FAR)  # coast forward unless well off-side
+                    centered = abs(bearing) < GOTO_BEAR_DEAD   # keep facing where we last saw it; drive only if lined up
 
                 blocked = (c >= avoid.STOP_NEAR or l >= avoid.SIDE_NEAR
                            or r >= avoid.SIDE_NEAR or loom >= avoid.LOOM_BRAKE)
@@ -1024,7 +1022,7 @@ async def main():
         """One connection lifecycle; returns when the socket drops or stop_event fires."""
         send_q = asyncio.Queue()          # fresh per-connection queue (drops stale events on reconnect)
         last_activity = {"t": 0.0}        # monotonic time of last voice activity; gates ambient pushes
-        adv = {"task": None}              # in-flight guarded-advance task, if any
+        adv = {"task": None, "kind": None}  # in-flight guarded task (+ kind: "home" go_to / "fwd" advance-navigate)
         scan_st = {"last": 0.0, "steps": 0, "last_turn": 0.0}   # last scan time + steps + last actual-turn time
         think_st = {"last": 0.0, "history": []}                 # last plan time + recent plans (planner memory)
 
@@ -1129,7 +1127,18 @@ async def main():
                         call_id = evt.get("call_id", "")
                         arguments = evt.get("arguments", "")
                         log("[tool] %s(%s)" % (name, arguments))
-                        if name == "look":
+                        # while go_to is autonomously driving to the locked thing, the model tends to fire
+                        # scan/look/find_it and CANCEL it mid-approach (any of them calls cancel_advance).
+                        # Refuse those until it finishes, so it can't sabotage its own drive. stop still halts
+                        # it (handled below), and it self-reports on arrival / real loss.
+                        if (name in ("look", "scan", "find_it", "lock_on")
+                                and adv["task"] is not None and not adv["task"].done()
+                                and adv.get("kind") == "home"):
+                            await enqueue(func_output(call_id, {"ok": False,
+                                "note": "I'm driving to it right now — hold on. I'll tell you when I arrive, "
+                                        "or if I lose it and need to look again."}))
+                            await enqueue({"type": "response.create"})
+                        elif name == "look":
                             # ack the call, attach a fresh crisp photo, then let it respond.
                             # cv2 encode runs in a thread so it never stalls audio playback.
                             durl = await to_thread(frame_data_url, LOOK_MAXDIM, LOOK_QUALITY)
@@ -1253,6 +1262,7 @@ async def main():
                             spd = _clamp(args_of(arguments).get("speed", 1.0), 0.6, 1.0, 1.0)
                             steer = (name == "navigate")
                             adv["task"] = asyncio.create_task(guarded_forward(spd, enqueue, steer))
+                            adv["kind"] = "fwd"
                             adv["task"].add_done_callback(_log_task_death)
                             await enqueue(func_output(call_id, {"ok": True, "detail": (
                                 "on my way; steering around obstacles" if steer
@@ -1317,9 +1327,10 @@ async def main():
                             await cancel_advance()
                             spd = _clamp(args_of(arguments).get("speed", 1.0), 0.6, 1.0, 1.0)
                             adv["task"] = asyncio.create_task(guarded_home(spd, enqueue))
+                            adv["kind"] = "home"
                             adv["task"].add_done_callback(_log_task_death)
                             await enqueue(func_output(call_id, {"ok": True,
-                                "detail": "heading to it; I'll keep it centred and stop when I'm there"}))
+                                "detail": "on it — I'll turn to face it and drive there myself; just wait for my update"}))
                         elif name == "think":
                             # route a hard spatial decision to the stronger planner (Claude), giving it
                             # the live surroundings AND the recent plans this attempt so it iterates
