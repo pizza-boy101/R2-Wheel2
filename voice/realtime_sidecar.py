@@ -97,7 +97,12 @@ NAV_FRESH = float(env("NAV_FRESH", "0.6"))                   # treat perception'
 # go_to (drive to a locked visual target): steer to keep it centred, skirt obstacles, stop on the sonar.
 GOTO_MAX_SECS = float(env("GOTO_MAX_SECS", "45"))             # safety cap on one homing run (Claude-per-step is slower)
 GOTO_LOST_SECS = float(env("GOTO_LOST_SECS", "1.2"))          # tracker 'lost' this long -> give up, ask to re-find
-GOTO_BEAR_DEAD = float(env("GOTO_BEAR_DEAD", "0.10"))         # |bearing| under this = centred enough
+GOTO_BEAR_DEAD = float(env("GOTO_BEAR_DEAD", "0.10"))         # |bearing| under this = centred enough (up close)
+GOTO_BEAR_DEAD_FAR = float(env("GOTO_BEAR_DEAD_FAR", "0.15"))  # extra centring slack when the thing is far/small:
+                                                             # 'roughly aimed' is fine at distance, precise up close
+GOTO_BLIND_STEPS = int(env("GOTO_BLIND_STEPS", "6"))         # keep committing toward the last-seen spot for this many
+                                                             # not-found looks before giving up — a small/far object
+                                                             # blinks in and out of Claude's view, so don't quit on a miss
 # self-healing lock: while homing, use Claude (the strong eye) to keep the dumb CSRT tracker honest —
 # re-box the named thing in the background and re-seed when the tracker drifts off it or loses it.
 GOTO_RELOCK_EVERY = float(env("GOTO_RELOCK_EVERY", "4.0"))    # periodic background re-locate cadence while homing
@@ -520,6 +525,7 @@ async def guarded_home(speed, enqueue):
     start = time.monotonic()
     label = read_goal_label() or "the target"     # what find_it locked; what we re-find each step
     fails = 0
+    last_bearing = 0.0                             # last bearing we actually saw -> commit toward it through misses
     try:
         tg = read_target()
         if not (tg and tg.get("active")):
@@ -546,25 +552,32 @@ async def guarded_home(speed, enqueue):
                 # finds the thing or says not-found; it never hands back a random jump. We still re-seed
                 # the tracker from Claude's box so the dashboard overlay stays honest.
                 box = await to_thread(call_locator, label)
-                if box is None:
+                if box is not None:
+                    # got a fresh fix -> steer on it, and remember it to coast on if the next look misses
+                    fails = 0
+                    seed_box(box, label)
+                    write_locate(label, True, box, True)
+                    bearing = (box[0] + box[2] / 2.0) - 0.5   # Claude's pixel bearing: - = left, + = right
+                    size = box[2] * box[3]
+                    last_bearing = bearing
+                    # looser 'centred' when it's far/small (just aim roughly and drive at it), tightening to
+                    # GOTO_BEAR_DEAD as it fills the frame -> precise only when it matters, up close
+                    dead = GOTO_BEAR_DEAD + GOTO_BEAR_DEAD_FAR * (1.0 - min(1.0, size / GOTO_SIZE_ARRIVE))
+                    centered = abs(bearing) < dead
+                    if centered and (avoid.ultra_blocked(ucm, uvalid) or c >= avoid.STOP_NEAR
+                                     or size >= GOTO_SIZE_ARRIVE):
+                        reason = "I'm right up next to it"; break
+                else:
+                    # missed it this look (small/far things blink out after a move). DON'T quit — commit
+                    # toward where we last saw it and re-check as we close in (bigger = easier to spot).
                     fails += 1
                     write_locate(label, False, None, False)
-                    if avoid.ultra_blocked(ucm, uvalid):
-                        reason = "I'm right up next to it"; break   # too close to box it -> we've arrived
-                    if fails >= GOTO_RELOCK_MAX_FAILS:
+                    if avoid.ultra_blocked(ucm, uvalid) and abs(last_bearing) < GOTO_BEAR_DEAD:
+                        reason = "I'm right up next to it"; break   # lined up and something's right ahead
+                    if fails >= GOTO_BLIND_STEPS:
                         reason = "I lost it and couldn't re-find it"; break
-                    motor("stop")
-                    await asyncio.sleep(GOTO_PULSE_SETTLE); continue
-                fails = 0
-                seed_box(box, label)
-                write_locate(label, True, box, True)
-                bearing = (box[0] + box[2] / 2.0) - 0.5       # Claude's pixel bearing: - = left, + = right
-                size = box[2] * box[3]
-                centered = abs(bearing) < GOTO_BEAR_DEAD
-                # arrived: centred AND right in front (sonar standoff, camera block, or it fills the frame)
-                if centered and (avoid.ultra_blocked(ucm, uvalid) or c >= avoid.STOP_NEAR
-                                 or size >= GOTO_SIZE_ARRIVE):
-                    reason = "I'm right up next to it"; break
+                    bearing = last_bearing
+                    centered = abs(bearing) < (GOTO_BEAR_DEAD + GOTO_BEAR_DEAD_FAR)  # coast forward unless well off-side
 
                 blocked = (c >= avoid.STOP_NEAR or l >= avoid.SIDE_NEAR
                            or r >= avoid.SIDE_NEAR or loom >= avoid.LOOM_BRAKE)
