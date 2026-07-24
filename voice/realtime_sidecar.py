@@ -98,6 +98,12 @@ NAV_FRESH = float(env("NAV_FRESH", "0.6"))                   # treat perception'
 GOTO_MAX_SECS = float(env("GOTO_MAX_SECS", "30"))             # safety cap on one homing run
 GOTO_LOST_SECS = float(env("GOTO_LOST_SECS", "1.2"))          # tracker 'lost' this long -> give up, ask to re-find
 GOTO_BEAR_DEAD = float(env("GOTO_BEAR_DEAD", "0.10"))         # |bearing| under this = centred enough
+# self-healing lock: while homing, use Claude (the strong eye) to keep the dumb CSRT tracker honest —
+# re-box the named thing in the background and re-seed when the tracker drifts off it or loses it.
+GOTO_RELOCK_EVERY = float(env("GOTO_RELOCK_EVERY", "4.0"))    # periodic background re-locate cadence while homing
+GOTO_RELOCK_DRIFT = float(env("GOTO_RELOCK_DRIFT", "0.20"))   # re-seed if Claude's box centre is >this (norm) off the
+                                                             # tracker's — catches drift onto background before it's lost
+GOTO_RELOCK_MAX_FAILS = int(env("GOTO_RELOCK_MAX_FAILS", "2"))  # give up only after Claude ALSO can't see it this many times
 GOTO_KP = float(env("GOTO_KP", "2.2"))                        # bearing -> turn-rate gain (proportional steering)
 GOTO_WMAX = float(env("GOTO_WMAX", "0.7"))                    # cap on the turn component
 GOTO_SIZE_ARRIVE = float(env("GOTO_SIZE_ARRIVE", "0.30"))    # target filling this frac of frame = we're there
@@ -266,7 +272,7 @@ TOOLS = [
                   "description": "how big the target looks in the frame right now (default medium)"}},
          "required": ["label"]}},
     {"type": "function", "name": "go_to",
-     "description": "Drive to the thing you locked onto (with find_it or lock_on): the robot keeps it centred, steers around obstacles by itself, and stops just short when it arrives. Continuous and self-reacting — do NOT babysit it. It reports back when it arrives, or if it loses sight of the target (then call find_it to re-find it). Requires a lock first.",
+     "description": "Drive to the thing you locked onto (with find_it or lock_on): the robot keeps it centred, steers around obstacles by itself, and stops just short when it arrives. It also RE-FINDS the thing on its own if the lock slips mid-drive (a sharper eye re-checks in the background), so a brief loss won't derail it. Continuous and self-reacting — do NOT babysit it. It reports back when it arrives, or only if it truly can't re-find the thing (then call find_it). Requires a lock first.",
      "parameters": {"type": "object", "properties": {
          "speed": {"type": "number", "description": "0.6..1 (below 0.6 the motors stall), default 1"}},
          "required": []}},
@@ -503,6 +509,10 @@ async def guarded_home(speed, enqueue):
     reason = "I couldn't get to it"
     start = time.monotonic()
     lost_since = None
+    label = read_goal_label() or "the target"     # what we're chasing, for background re-locates
+    relock_task = None                             # in-flight background Claude re-locate (never blocks the loop)
+    last_relock = start
+    relock_fails = 0
     try:
         tg = read_target()
         if not (tg and tg.get("active")):
@@ -525,15 +535,40 @@ async def guarded_home(speed, enqueue):
                 loom = st.get("loom", 0) or 0
                 ucm, uvalid = read_ultra()
 
-                # lost sight: tolerate a brief blip (occlusion / motion blur), then give up so the
-                # model can re-scan and re-lock rather than wander blind
+                # ---- self-healing lock: keep a background Claude re-locate in flight and, when it
+                # lands, re-seed the tracker if it has drifted off the thing or lost it. Claude is the
+                # honest eye; the CSRT tracker is just the fast glue between re-locates. Never blocks. ----
+                if relock_task is not None and relock_task.done():
+                    try:
+                        rbox = relock_task.result()
+                    except Exception:
+                        rbox = None
+                    relock_task = None
+                    if rbox is not None:
+                        relock_fails = 0
+                        cur_box = tg.get("box") if (tg.get("active") and not tg.get("lost")) else None
+                        if cur_box is None or box_center_dist(rbox, cur_box) >= GOTO_RELOCK_DRIFT:
+                            seed_box(rbox, label)                 # snap the tracker back onto the real thing
+                            write_locate(label, True, rbox, True)  # dashboard shows the correction
+                            log("go_to: re-locked on %s" % label)
+                            lost_since = None                      # fresh lock -> reset the give-up clock
+                    else:
+                        relock_fails += 1                          # Claude couldn't see it this time
+                        write_locate(label, False, None, False)
+                if (tg.get("lost") or (now - last_relock) >= GOTO_RELOCK_EVERY) and relock_task is None:
+                    last_relock = now
+                    relock_task = asyncio.create_task(to_thread(call_locator, label))
+
+                # lost sight: don't quit on a blip — a re-locate is already in flight above. Give up only
+                # once it's been lost a while AND Claude also can't re-find it.
                 if tg.get("lost"):
                     lost_since = now if lost_since is None else lost_since
-                    if now - lost_since > GOTO_LOST_SECS:
-                        reason = "I lost sight of it"; break
+                    if now - lost_since > GOTO_LOST_SECS and relock_fails >= GOTO_RELOCK_MAX_FAILS:
+                        reason = "I lost it and couldn't re-find it"; break
                     motor("stop")
                     await asyncio.sleep(0.05); continue
                 lost_since = None
+                relock_fails = 0                                   # tracking fine -> only consecutive-while-lost fails count
 
                 bearing = tg.get("bearing", 0.0)
                 centered = abs(bearing) < GOTO_BEAR_DEAD
@@ -566,6 +601,8 @@ async def guarded_home(speed, enqueue):
         raise
     finally:
         motor("stop")
+        if relock_task is not None and not relock_task.done():
+            relock_task.cancel()                    # don't leave a background re-locate dangling
         if not cancelled:
             clear_goal()                            # terminal end -> drop the lock
         log("go_to stopped: %s" % ("cancelled" if cancelled else reason))
@@ -717,6 +754,25 @@ def read_target():
     """Latest tracker target dict (active/bearing/size/lost) or None."""
     st = read_nav_state()
     return (st or {}).get("target") if st else None
+
+
+def read_goal_label():
+    """The label of the thing currently seeded/locked (what find_it was asked for), or None."""
+    try:
+        with open(GOAL) as f:
+            return json.load(f).get("label")
+    except Exception:
+        return None
+
+
+def box_center_dist(a, b):
+    """Distance between the centres of two normalized [x,y,w,h] boxes; 1.0 if either is missing."""
+    try:
+        ax, ay = a[0] + a[2] / 2.0, a[1] + a[3] / 2.0
+        bx, by = b[0] + b[2] / 2.0, b[1] + b[3] / 2.0
+        return ((ax - bx) ** 2 + (ay - by) ** 2) ** 0.5
+    except Exception:
+        return 1.0
 
 
 def surroundings_summary():
