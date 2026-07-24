@@ -97,8 +97,11 @@ NAV_FRESH = float(env("NAV_FRESH", "0.6"))                   # treat perception'
 # go_to (drive to a locked visual target): steer to keep it centred, skirt obstacles, stop on the sonar.
 GOTO_MAX_SECS = float(env("GOTO_MAX_SECS", "45"))             # safety cap on one homing run (Claude-per-step is slower)
 GOTO_LOST_SECS = float(env("GOTO_LOST_SECS", "1.2"))          # tracker 'lost' this long -> give up, ask to re-find
-GOTO_BEAR_DEAD = float(env("GOTO_BEAR_DEAD", "0.12"))         # |bearing| under this = lined up enough to drive; beyond
-                                                             # it, TURN TO FACE the thing first (near OR far)
+GOTO_BEAR_DEAD = float(env("GOTO_BEAR_DEAD", "0.10"))         # tight 'centred' band used up CLOSE (precise final aim)
+GOTO_BEAR_DEAD_FAR = float(env("GOTO_BEAR_DEAD_FAR", "0.22"))  # loose band when far/small: if the thing's roughly ahead,
+                                                             # just DRIVE at it to close the distance; only turn to face
+                                                             # it if it's clearly off to a side. Tightens to _DEAD as it
+                                                             # fills the frame -> fine centring only when it's near.
 GOTO_BLIND_STEPS = int(env("GOTO_BLIND_STEPS", "6"))         # keep committing toward the last-seen spot for this many
                                                              # not-found looks before giving up — a small/far object
                                                              # blinks in and out of Claude's view, so don't quit on a miss
@@ -110,11 +113,11 @@ GOTO_RELOCK_DRIFT = float(env("GOTO_RELOCK_DRIFT", "0.20"))   # re-seed if Claud
 GOTO_RELOCK_MAX_FAILS = int(env("GOTO_RELOCK_MAX_FAILS", "2"))  # give up only after Claude ALSO can't see it this many times
 # pulsed homing: drive in short bursts and PAUSE between them so the tracker reads a sharp frame, instead
 # of trying to track through continuous motion blur (which was making it lose the object while approaching).
-GOTO_PULSE_DRIVE = float(env("GOTO_PULSE_DRIVE", "0.3"))     # forward burst length before pausing to look
-GOTO_PULSE_TURN = float(env("GOTO_PULSE_TURN", "0.18"))      # MAX centring turn burst; scaled down near centre so a
+GOTO_PULSE_DRIVE = float(env("GOTO_PULSE_DRIVE", "0.45"))    # forward burst length — longer so it closes distance
+GOTO_PULSE_TURN = float(env("GOTO_PULSE_TURN", "0.12"))      # MAX centring turn burst; scaled down near centre so a
                                                              # single step never swings past where the (1-2s old) box
                                                              # said the thing was -> no chasing the 'afterimage'
-GOTO_PULSE_TURN_MIN = float(env("GOTO_PULSE_TURN_MIN", "0.07"))  # floor so a tiny turn still actually moves the wheels
+GOTO_PULSE_TURN_MIN = float(env("GOTO_PULSE_TURN_MIN", "0.06"))  # floor so a tiny turn still actually moves the wheels
 GOTO_HOME_TURN_SPEED = float(env("GOTO_HOME_TURN_SPEED", "0.6"))  # gentle turn (motor floor) so centring doesn't overshoot
 GOTO_PULSE_SETTLE = float(env("GOTO_PULSE_SETTLE", "0.45"))  # stop-and-look pause: let motion stop AND a fresh frame land
                                                              # before Claude looks, so it reads NOW, not a frame ago
@@ -563,9 +566,11 @@ async def guarded_home(speed, enqueue):
                     box_bottom = box[1] + box[3]              # how low the thing sits in frame; floor objects drop
                                                               # toward the bottom as we close in on them
                     last_bearing = bearing
-                    # turn to FACE it whenever it's off to a side — near OR far. Only drive forward once it's
-                    # lined up ahead. (The proportional turn below is tiny near centre, so no wiggle.)
-                    centered = abs(bearing) < GOTO_BEAR_DEAD
+                    # 'centred enough to drive' — loose when the thing is far/small (close the distance first),
+                    # tightening to GOTO_BEAR_DEAD as it fills the frame (fine aim only when it's near). So it
+                    # drives AT a roughly-ahead target and saves microadjustments for when it's close & accurate.
+                    dead = GOTO_BEAR_DEAD + (GOTO_BEAR_DEAD_FAR - GOTO_BEAR_DEAD) * (1.0 - min(1.0, size / GOTO_SIZE_ARRIVE))
+                    centered = abs(bearing) < dead
                     # arrived only when lined up AND actually AT the THING: sonar standoff, it fills the frame,
                     # or it has dropped to the bottom of the view. Deliberately NOT camera depth (c>=STOP_NEAR):
                     # the low camera reads the near floorboards as 'close' and that faked arrival on a far ball.
@@ -582,7 +587,8 @@ async def guarded_home(speed, enqueue):
                     if fails >= GOTO_BLIND_STEPS:
                         reason = "I lost it and couldn't re-find it"; break
                     bearing = last_bearing
-                    centered = abs(bearing) < GOTO_BEAR_DEAD   # keep facing where we last saw it; drive only if lined up
+                    centered = abs(bearing) < GOTO_BEAR_DEAD_FAR   # blind: coast forward toward where we last saw it
+                                                                   # unless it was clearly off to a side
 
                 blocked = (c >= avoid.STOP_NEAR or l >= avoid.SIDE_NEAR
                            or r >= avoid.SIDE_NEAR or loom >= avoid.LOOM_BRAKE)

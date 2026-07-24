@@ -340,14 +340,12 @@ function drawOverlay(s){
   if(ov.width!==cw)ov.width=cw;if(ov.height!==ch)ov.height=ch;
   var ctx=ov.getContext("2d");ctx.clearRect(0,0,cw,ch);
   var msg="";
-  // live tracker lock (green) — follows the object frame to frame
-  var t=s.target||{};
-  if(t.active&&!t.lost&&t.box){boxOn(ctx,cw,ch,t.box,"#3fb950","lock");}
-  // last find_it result (cyan) — the box Claude reported, only fresh for a few seconds
+  // the lock box = what the SHARP eye (Claude/find_it) actually reported — the thing go_to steers by.
+  // (the raw CSRT tracker box isn't drawn: go_to no longer steers by it and it just jitters.)
   var lc=s.locate;
   if(lc){var age=(Date.now()/1000)-(lc.ts||0);
     if(age<LOCATE_SHOW_SECS){
-      if(lc.found&&lc.box){boxOn(ctx,cw,ch,lc.box,"#39d0d8",(lc.thing||"target")+(lc.locked?" ✓lock":" seen"));}
+      if(lc.found&&lc.box){boxOn(ctx,cw,ch,lc.box,"#3fb950",(lc.thing||"target")+(lc.locked?" ✓lock":" seen"));}
       else if(!lc.found){msg="looked for “"+(lc.thing||"?")+"” — not seen";}
     }
   }
