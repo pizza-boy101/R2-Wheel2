@@ -120,7 +120,9 @@ GOTO_PULSE_SETTLE = float(env("GOTO_PULSE_SETTLE", "0.45"))  # stop-and-look pau
                                                              # before Claude looks, so it reads NOW, not a frame ago
 GOTO_KP = float(env("GOTO_KP", "2.2"))                        # bearing -> turn-rate gain (proportional steering)
 GOTO_WMAX = float(env("GOTO_WMAX", "0.7"))                    # cap on the turn component
-GOTO_SIZE_ARRIVE = float(env("GOTO_SIZE_ARRIVE", "0.30"))    # target filling this frac of frame = we're there
+GOTO_SIZE_ARRIVE = float(env("GOTO_SIZE_ARRIVE", "0.22"))    # target filling this frac of frame = we're there
+GOTO_ARRIVE_Y = float(env("GOTO_ARRIVE_Y", "0.80"))          # target's bottom edge this far down the frame = it's at
+                                                             # the robot's feet (floor objects drop low as you close in)
 LOCK_BOX = {"small": (0.16, 0.20), "medium": (0.30, 0.36), "large": (0.50, 0.56)}  # centred seed-box (w,h)
 # scan = "turn a small step, then look" — the search primitive (spin-until-you-see-it). Deliberately
 # a small step so it doesn't overshoot; the model calls it repeatedly and reads the photo each time.
@@ -558,12 +560,17 @@ async def guarded_home(speed, enqueue):
                     write_locate(label, True, box, True)
                     bearing = (box[0] + box[2] / 2.0) - 0.5   # Claude's pixel bearing: - = left, + = right
                     size = box[2] * box[3]
+                    box_bottom = box[1] + box[3]              # how low the thing sits in frame; floor objects drop
+                                                              # toward the bottom as we close in on them
                     last_bearing = bearing
                     # turn to FACE it whenever it's off to a side — near OR far. Only drive forward once it's
                     # lined up ahead. (The proportional turn below is tiny near centre, so no wiggle.)
                     centered = abs(bearing) < GOTO_BEAR_DEAD
-                    if centered and (avoid.ultra_blocked(ucm, uvalid) or c >= avoid.STOP_NEAR
-                                     or size >= GOTO_SIZE_ARRIVE):
+                    # arrived only when lined up AND actually AT the THING: sonar standoff, it fills the frame,
+                    # or it has dropped to the bottom of the view. Deliberately NOT camera depth (c>=STOP_NEAR):
+                    # the low camera reads the near floorboards as 'close' and that faked arrival on a far ball.
+                    if centered and (avoid.ultra_blocked(ucm, uvalid) or size >= GOTO_SIZE_ARRIVE
+                                     or box_bottom >= GOTO_ARRIVE_Y):
                         reason = "I'm right up next to it"; break
                 else:
                     # missed it this look (small/far things blink out after a move). DON'T quit — commit
