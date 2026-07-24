@@ -162,12 +162,16 @@ INSTRUCTIONS = (
     "won't move; default to full speed 1.0 unless the user asks to go slower), and a short duration "
     "in seconds — prefer brief bursts (0.5 to 1.5 s) and re-check rather than long "
     "blind drives. Call stop the instant the user says stop (it also cancels an advance). "
-    "VISION: you continuously receive short text camera updates like '(camera) most open left; target "
-    "in view on the right' — which direction is most open, whether something is getting closer, and "
-    "whether a tracked target is in view. This is your CONSTANT background awareness, so you almost "
-    "always already know the current scene without looking; use it directly. Do NOT call look for "
-    "ordinary moves or to check those things — you already have them. Call the look tool ONLY when the "
-    "user asks what you see or you must actually identify/describe something with your own eyes. "
+    "VISION: you continuously receive short text camera updates like '(camera) most open left; camera "
+    "locked on something to the right' — which direction is most open, whether something is getting closer, "
+    "and whether the camera has a lock. This is your CONSTANT background awareness for OPENNESS and MOVEMENT, "
+    "so you almost always already know the layout without looking; use it directly for driving decisions. Do "
+    "NOT call look for ordinary moves. BUT these notes CANNOT tell you WHAT a thing is: the camera lock grabs "
+    "whatever sits in the middle of the view — often a person, a wall, furniture — NOT necessarily the thing "
+    "you were asked to find. So NEVER conclude you've found or centred the thing you're searching for from a "
+    "'locked'/'centred' note or any background text alone. Before you say you found it or drive to it, CONFIRM "
+    "WITH YOUR OWN EYES — read the photo the scan returned, or call look — that the centred thing really is "
+    "what you were asked for. If it isn't, keep searching. "
     "SEARCHING / FINDING: when asked to look around, spin until you see something, or find or identify a "
     "thing, use the scan tool, NOT drive. The FIRST scan just shows you the view from where you already "
     "are, without moving — look at it first. Each scan AFTER that turns the car a small step to the LEFT "
@@ -767,11 +771,11 @@ def scene_summary(st):
         parts.append("something getting closer ahead")
     if tg.get("active"):
         if tg.get("lost"):
-            parts.append("target lost")
+            parts.append("lost the camera lock")
         else:
             b = tg.get("bearing", 0.0)
-            where = "centered" if abs(b) < 0.08 else ("on the left" if b < 0 else "on the right")
-            parts.append("target in view %s" % where)
+            where = "centred" if abs(b) < 0.08 else ("to the left" if b < 0 else "to the right")
+            parts.append("camera locked on something %s (not confirmed — look to see what it is)" % where)
     return "; ".join(parts)
 
 
@@ -990,7 +994,11 @@ async def main():
                                         bearing = tg.get("bearing", 0.0)   # pixel-measured: - = left, + = right
                                         if abs(bearing) <= GOTO_BEAR_DEAD:
                                             durl = await to_thread(frame_data_url, LOOK_MAXDIM, LOOK_QUALITY)
-                                            note = "it's centred now and I'm locked on — say what it is, or go to it."
+                                            note = ("something is centred and locked — but the lock grabs whatever "
+                                                    "is in the MIDDLE, which may NOT be what you're after. LOOK at "
+                                                    "this photo and be sure the centred thing really is it: if yes, "
+                                                    "go to it; if it's something else (a person, a chair...), the "
+                                                    "thing you want is still off to a side — scan a 'step' to keep looking.")
                                             cap = "Camera view — target centred:"
                                         else:
                                             autoside = "right" if bearing > 0 else "left"
@@ -1002,8 +1010,10 @@ async def main():
                                             motor("%s %.2f %.2f" % (turn, SCAN_TURN_SPEED, SCAN_NUDGE_SECS))
                                             await asyncio.sleep(SCAN_NUDGE_SECS + SCAN_NUDGE_SETTLE)
                                             durl = await to_thread(frame_data_url, LOOK_MAXDIM, LOOK_QUALITY)
-                                            note = ("centring on it automatically (it's to the %s of centre) — scan "
-                                                    "'center' again to keep going; I'll tell you when it's centred." % autoside)
+                                            note = ("centring the locked thing automatically (it's to the %s of "
+                                                    "centre) — scan 'center' again to keep going. Check the photo "
+                                                    "that the thing I locked is the one you want; if it isn't, scan "
+                                                    "a 'step' to keep looking instead." % autoside)
                                             cap = "Camera view after an auto-centring nudge %s:" % autoside
                                     else:
                                         durl = await to_thread(frame_data_url, LOOK_MAXDIM, LOOK_QUALITY)
@@ -1011,6 +1021,10 @@ async def main():
                                                 "one 'step' toward it to bring it inward, then scan 'center' again.")
                                         cap = "Current camera view (no lock to centre on):"
                             else:
+                                # sweeping = still SEARCHING, so drop any existing lock: it was at best a
+                                # guess at whatever sat in the middle, and letting it linger makes the ambient
+                                # notes keep claiming a "target" that may be the wrong thing (a person, a chair).
+                                clear_goal()
                                 fresh_sweep = (now_m - prev_last) > SCAN_SWEEP_GAP
                                 if fresh_sweep:
                                     scan_st["steps"] = 0
