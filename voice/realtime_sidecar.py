@@ -19,6 +19,7 @@ Env (all optional):
   REALTIME_LOG      log file                      (default ~/robot/realtime.log)
 """
 import os
+import re
 import sys
 import json
 import time
@@ -64,6 +65,12 @@ PLANNER_TIMEOUT = float(env("PLANNER_TIMEOUT", "8"))    # give up on the planner
                                                         # deaf/mute waiting (motors already dead-man in 0.5 s)
 THINK_COOLDOWN = float(env("THINK_COOLDOWN", "8"))      # don't re-plan within this of the last plan; carry the
                                                         # last one out first (stops the model spamming the planner)
+# find_it: Claude (Opus, a much stronger vision model than the realtime voice one) locates a named
+# object in the current frame and hands back a box we seed the tracker with — open-vocabulary, no
+# YOLO/training. Called only to ACQUIRE/re-acquire (~1-2 s); the CSRT tracker follows in between.
+LOCATOR_MODEL = env("LOCATOR_MODEL", "claude-opus-4-8")
+LOCATOR_TIMEOUT = float(env("LOCATOR_TIMEOUT", "12"))
+LOCATOR_MAXDIM = int(env("LOCATOR_MAXDIM", "1024"))     # frame long-edge sent to Claude (bigger = better boxes)
 WORKSPACE = env("ROBOT_WORKSPACE", os.path.join(HOME, "robot", "workspace"))
 MOVE = os.path.join(WORKSPACE, "move")
 DISARM = os.path.join(WORKSPACE, ".disarmed")       # kill switch flag (move disarm)
@@ -193,17 +200,17 @@ INSTRUCTIONS = (
     "by step, until you have gone a FULL circle (the view note tells you the step count and how many make a "
     "circle) before you ever conclude something isn't there. Finding nothing in the first few steps means "
     "keep going, NOT stop. "
-    "GOING TO SOMETHING (a mission): when asked to find something and go to it, run the whole job yourself "
-    "as a loop, speaking only a short update at each stage. First sweep with scan to find it. If a full "
-    "sweep turns up nothing, turn toward the most open direction the camera reports and navigate forward a "
-    "little to a new spot, then sweep again from there; repeat until you find it. Once it is clearly and "
-    "fully in view (not just a sliver at the edge), scan toward it until it is roughly CENTRED, then call "
-    "lock_on and then go_to: go_to drives to it on its own — keeping it centred, steering around obstacles, "
-    "and stopping just short — so you do NOT steer it there yourself or babysit it. Do NOT use navigate to "
-    "approach a specific target; navigate is only for open-ended 'go that way / explore' with nothing "
-    "particular in mind. If go_to reports it lost sight of the target, scan to find it again, lock_on again, "
-    "then go_to again. Keep the loop going until you've reached it or it's clearly not findable — don't stop "
-    "after one step or wait to be told to keep going. "
+    "GOING TO SOMETHING (a mission): when asked to find and go to a NAMED thing, run the whole job yourself "
+    "as a loop, speaking only a short update at each stage. Hold still and call find_it with what you want "
+    "(e.g. 'a red mug') — a sharper eye finds it wherever it is in view and locks on; you do NOT need to "
+    "centre it first. If find_it locks on, call go_to and you're done driving — go_to reaches it on its own, "
+    "keeping it centred, steering around obstacles, and stopping just short, so you do NOT steer it there or "
+    "babysit it. If find_it says it can't see the thing, sweep ONE scan 'step' to show it a new part of the "
+    "room and call find_it again; keep going around, and if a full circle turns up nothing, navigate a little "
+    "to a new spot and sweep-and-find_it again. Do NOT use navigate to approach a specific target; navigate "
+    "is only for open-ended 'go that way / explore'. If go_to reports it lost sight of the target, just call "
+    "find_it again to re-find it, then go_to. Keep the loop going until you've reached it or it's clearly not "
+    "findable — don't stop after one step or wait to be told to keep going. "
     "THINKING IT THROUGH: if you get genuinely stuck — a full sweep finds nothing, you're boxed into a tight "
     "space, or reaching a goal needs real multi-step planning around obstacles — call think with a short "
     "description of the situation and your goal. A stronger reasoning model hands back a short plan; carry it "
@@ -245,15 +252,20 @@ TOOLS = [
          "amount": {"type": "string", "enum": ["step", "center"],
                     "description": "'step' = a full camera-width sweep step (default); 'center' = a tiny centring nudge for a target that's already in view but off to one side"}},
          "required": []}},
+    {"type": "function", "name": "find_it",
+     "description": "Find and lock onto a specific thing by description, so you can then go to it — 'a red mug', 'my backpack', 'the mountain dew can', anything you can name. This uses a SHARPER eye than your quick camera glances: it finds the thing WHEREVER it is in the current view (you do NOT need to centre it first) and locks the tracker onto exactly it. This is the RIGHT way to start any 'go to / fetch / find the <named thing>' job. How to use: face the area and hold still, then call find_it with what you want. If it says it found and locked on, call go_to. If it says it can't see the thing, sweep one scan 'step' to show it a new part of the room, then call find_it again — repeat around the room. If go_to later says it lost sight of it, call find_it again to re-find it.",
+     "parameters": {"type": "object", "properties": {
+         "thing": {"type": "string", "description": "what to find, described plainly, e.g. 'a red coffee mug', 'the mountain dew can'"}},
+         "required": ["thing"]}},
     {"type": "function", "name": "lock_on",
-     "description": "Lock onto the thing you want to drive to, so the robot can track it and home in. Call this ONLY once the target is clearly and fully in view and roughly CENTRED in the frame (scan toward it first until it's centred) — it locks onto whatever is in the middle of the view. After it locks, call go_to. If it says it couldn't lock, centre the target better and try again.",
+     "description": "Fallback lock: grabs whatever is in the MIDDLE of the view right now. Prefer find_it for anything you can name (it finds the thing wherever it is and won't grab the wrong object). Use lock_on only to grab whatever's already centred when find_it isn't suitable. After it locks, call go_to.",
      "parameters": {"type": "object", "properties": {
          "label": {"type": "string", "description": "what you're locking onto, e.g. 'the trash can' (for your own reference)"},
          "size": {"type": "string", "enum": ["small", "medium", "large"],
                   "description": "how big the target looks in the frame right now (default medium)"}},
          "required": ["label"]}},
     {"type": "function", "name": "go_to",
-     "description": "Drive to the target you locked onto with lock_on: the robot keeps it centred, steers around obstacles by itself, and stops just short when it arrives. Continuous and self-reacting — do NOT babysit it. It reports back when it arrives, or if it loses sight of the target (then scan to find it again and lock_on again). Requires a lock first.",
+     "description": "Drive to the thing you locked onto (with find_it or lock_on): the robot keeps it centred, steers around obstacles by itself, and stops just short when it arrives. Continuous and self-reacting — do NOT babysit it. It reports back when it arrives, or if it loses sight of the target (then call find_it to re-find it). Requires a lock first.",
      "parameters": {"type": "object", "properties": {
          "speed": {"type": "number", "description": "0.6..1 (below 0.6 the motors stall), default 1"}},
          "required": []}},
@@ -652,12 +664,16 @@ def read_ultra():
         return None, False
 
 
-def seed_goal(label, size="medium"):
-    """Seed perception's target tracker with a CENTRED box. The model centres the target by
-    scanning first, so we don't need pixel coordinates from it (which vision models get wrong) —
-    we just lock the tracker onto whatever is in the middle of the frame right now."""
-    w, h = LOCK_BOX.get(size, LOCK_BOX["medium"])
-    box = [round((1.0 - w) / 2.0, 3), round((1.0 - h) / 2.0, 3), w, h]   # centred [x,y,w,h] normalized
+def seed_box(box, label):
+    """Seed perception's tracker with an explicit normalized [x,y,w,h] box (clamped to frame).
+    Used by find_it to lock onto WHERE Claude actually saw the object, not a blind centred guess."""
+    try:
+        x, y, w, h = [float(v) for v in box]
+    except Exception:
+        return False
+    x = max(0.0, min(0.98, x)); y = max(0.0, min(0.98, y))
+    w = max(0.02, min(1.0 - x, w)); h = max(0.02, min(1.0 - y, h))
+    box = [round(x, 3), round(y, 3), round(w, 3), round(h, 3)]
     tmp = GOAL + ".tmp"
     try:
         with open(tmp, "w") as f:
@@ -666,6 +682,12 @@ def seed_goal(label, size="medium"):
         return True
     except Exception:
         return False
+
+
+def seed_goal(label, size="medium"):
+    """Seed the tracker with a CENTRED box (legacy path: lock onto whatever's in the middle)."""
+    w, h = LOCK_BOX.get(size, LOCK_BOX["medium"])
+    return seed_box([(1.0 - w) / 2.0, (1.0 - h) / 2.0, w, h], label)
 
 
 def clear_goal():
@@ -717,6 +739,63 @@ PLANNER_SYSTEM = (
     "concrete plan it can execute. The car has NO map, NO compass or odometry, and open-loop motors: "
     "it cannot turn precise angles or measure distance travelled, so plan in small steps with "
     "re-checks — never absolute angles or distances. Be concise: a few short numbered steps, no preamble.")
+
+
+def call_locator(thing):
+    """Ask Claude (Opus vision) for a bounding box of `thing` in the CURRENT frame. Returns a
+    normalized [x,y,w,h] box to seed the tracker with, or None if Claude can't see it / on any
+    failure (the caller then sweeps and retries). Blocking — run via to_thread."""
+    if not _CV2:
+        return None
+    try:
+        key = open(PLANNER_KEY_FILE).read().strip()
+    except Exception:
+        return None
+    try:
+        img = cv2.imread(FRAME_PATH)              # latest frame (atomic write on the producer side)
+        if img is None:
+            return None
+        h0, w0 = img.shape[:2]
+        scale = LOCATOR_MAXDIM / float(max(h0, w0))
+        if scale < 1.0:
+            img = cv2.resize(img, (int(w0 * scale), int(h0 * scale)), interpolation=cv2.INTER_AREA)
+        H, W = img.shape[:2]
+        ok, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 85])
+        if not ok:
+            return None
+        b64 = base64.b64encode(buf.tobytes()).decode()
+    except Exception:
+        return None
+    prompt = ("This is a %dx%d camera image (origin top-left, +x right, +y down). Find: %s.\n"
+              'If it is clearly visible, reply with ONLY {"found": true, "box": [x0, y0, x1, y1]} — a '
+              'TIGHT pixel box around it. If it is NOT clearly visible, reply with ONLY {"found": false}. '
+              "Do not guess or invent a box. No other text." % (W, H, thing))
+    body = json.dumps({"model": LOCATOR_MODEL, "max_tokens": 300,
+                       "messages": [{"role": "user", "content": [
+                           {"type": "image", "source": {"type": "base64",
+                            "media_type": "image/jpeg", "data": b64}},
+                           {"type": "text", "text": prompt}]}]}).encode()
+    req = urllib.request.Request("https://api.anthropic.com/v1/messages", data=body, method="POST")
+    req.add_header("x-api-key", key)
+    req.add_header("anthropic-version", "2023-06-01")
+    req.add_header("content-type", "application/json")
+    try:
+        r = urllib.request.urlopen(req, timeout=LOCATOR_TIMEOUT)
+        d = json.load(r)
+        text = "".join(b.get("text", "") for b in d.get("content", []) if b.get("type") == "text")
+        m = re.search(r"\{.*\}", text, re.S)
+        if not m:
+            return None
+        obj = json.loads(m.group(0))
+        if not obj.get("found") or not obj.get("box"):
+            return None
+        x0, y0, x1, y1 = [float(v) for v in obj["box"]]
+        if x1 <= x0 or y1 <= y0:
+            return None
+        return [x0 / W, y0 / H, (x1 - x0) / W, (y1 - y0) / H]   # -> normalized [x,y,w,h]
+    except Exception as e:
+        log("locator error: %s" % type(e).__name__)
+        return None
 
 
 def call_planner(situation, summary, history=None):
@@ -1071,6 +1150,42 @@ async def main():
                             await enqueue(func_output(call_id, {"ok": True, "detail": (
                                 "on my way; steering around obstacles" if steer
                                 else "rolling forward; I'll stop when I'm close to something")}))
+                        elif name == "find_it":
+                            # Claude (Opus vision) locates the NAMED thing in the current frame and hands
+                            # back a box; we seed the tracker on exactly that, so it locks the real object
+                            # wherever it is — not a blind centred guess. Stop + settle first for a crisp
+                            # frame, then confirm the tracker latched before telling the model to drive.
+                            thing = args_of(arguments).get("thing", "").strip()
+                            if not thing:
+                                await enqueue(func_output(call_id, {"ok": False,
+                                    "note": "tell me what to find (e.g. 'a red mug')"}))
+                                await enqueue({"type": "response.create"})
+                            else:
+                                await cancel_advance()
+                                motor("stop")
+                                await asyncio.sleep(0.25)                 # let a crisp, still frame land
+                                box = await to_thread(call_locator, thing)
+                                if box is None:
+                                    clear_goal()                          # no stale lock left behind
+                                    await enqueue(func_output(call_id, {"ok": False, "found": False,
+                                        "note": ("I don't see %s from here. Sweep one scan 'step' to look at a "
+                                                 "new part of the room, then find_it again." % thing)}))
+                                    await enqueue({"type": "response.create"})
+                                else:
+                                    locked = False
+                                    if seed_box(box, thing):
+                                        for _ in range(24):               # ~1.2 s for the tracker to latch
+                                            await asyncio.sleep(0.05)
+                                            tg = read_target()
+                                            if tg and tg.get("active") and not tg.get("lost"):
+                                                locked = True; break
+                                    if not locked:
+                                        clear_goal()
+                                    await enqueue(func_output(call_id, {"ok": locked, "found": True, "locked": locked,
+                                        "note": ("found %s and locked onto it — call go_to to drive to it" % thing
+                                                 if locked else
+                                                 "I spotted %s but couldn't get a solid lock — try find_it again" % thing)}))
+                                    await enqueue({"type": "response.create"})
                         elif name == "lock_on":
                             # seed perception's tracker on the (already-centred) target, then confirm
                             # it actually latched before telling the model to drive.
