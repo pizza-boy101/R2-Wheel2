@@ -78,6 +78,7 @@ FRAME_PATH = os.path.join(WORKSPACE, "frame.jpg")   # written by the perception 
 NAV_STATE = os.path.join(WORKSPACE, "nav_state.json")  # perception's structured free-space output
 ULTRA = os.path.join(WORKSPACE, "ultrasonic.json")  # front sonar distance (motor daemon publishes it)
 GOAL = os.path.join(WORKSPACE, "nav_goal.json")     # we WRITE this to seed perception's target tracker
+LOCATE = os.path.join(WORKSPACE, "locate.json")     # we WRITE find_it's last result so the dashboard can draw it
 CHAT_SOCK = os.path.join(WORKSPACE, "chat.sock")    # typed messages from the debug dashboard arrive here
 # guarded advance = roll forward and STEER AROUND obstacles locally, using the SAME
 # avoidance decision the autonomous loop uses (avoid.decide) — obstacle thresholds
@@ -690,6 +691,18 @@ def seed_goal(label, size="medium"):
     return seed_box([(1.0 - w) / 2.0, (1.0 - h) / 2.0, w, h], label)
 
 
+def write_locate(thing, found, box, locked):
+    """Publish find_it's last result so the debug dashboard can draw the box Claude reported."""
+    tmp = LOCATE + ".tmp"
+    try:
+        with open(tmp, "w") as f:
+            json.dump({"ts": time.time(), "thing": thing, "found": bool(found),
+                       "box": box, "locked": bool(locked)}, f)   # box = normalized [x,y,w,h] or None
+        os.replace(tmp, LOCATE)
+    except Exception:
+        pass
+
+
 def clear_goal():
     """Drop the lock -> perception clears its tracker (target goes inactive)."""
     try:
@@ -1167,6 +1180,7 @@ async def main():
                                 box = await to_thread(call_locator, thing)
                                 if box is None:
                                     clear_goal()                          # no stale lock left behind
+                                    write_locate(thing, False, None, False)   # dashboard: "looked, didn't see it"
                                     await enqueue(func_output(call_id, {"ok": False, "found": False,
                                         "note": ("I don't see %s from here. Sweep one scan 'step' to look at a "
                                                  "new part of the room, then find_it again." % thing)}))
@@ -1181,6 +1195,7 @@ async def main():
                                                 locked = True; break
                                     if not locked:
                                         clear_goal()
+                                    write_locate(thing, True, box, locked)   # dashboard: draw the box Claude saw
                                     await enqueue(func_output(call_id, {"ok": locked, "found": True, "locked": locked,
                                         "note": ("found %s and locked onto it — call go_to to drive to it" % thing
                                                  if locked else

@@ -394,7 +394,9 @@ def main():
                 x, y, w, h = box
                 cx = (x + w / 2.0) / W
                 target = {"active": True, "bearing": round(cx - 0.5, 3),
-                          "size": round((w * h) / float(W * H), 4), "lost": False}
+                          "size": round((w * h) / float(W * H), 4), "lost": False,
+                          "box": [round(x / W, 3), round(y / H, 3),   # normalized [x,y,w,h] for the dashboard overlay
+                                  round(w / W, 3), round(h / H, 3)]}
             else:
                 target = {"active": True, "bearing": 0.0, "size": 0.0, "lost": True}
 

@@ -28,6 +28,7 @@ NAV_STATE = os.path.join(WORKSPACE, "nav_state.json")
 FRAME = os.path.join(WORKSPACE, "frame.jpg")
 DISARM = os.path.join(WORKSPACE, ".disarmed")
 ULTRA = os.path.join(WORKSPACE, "ultrasonic.json")   # forward distance, published by motor daemon
+LOCATE = os.path.join(WORKSPACE, "locate.json")      # find_it's last result (the box Claude reported)
 MODE = os.path.join(WORKSPACE, "nav_mode")
 LOGS = {"voice": os.path.join(ROBOT, "realtime.log"),
         "nav": os.path.join(ROBOT, "nav.log"),
@@ -158,6 +159,8 @@ h1{font-size:14px;margin:0;font-weight:600}
 .card{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:10px;margin-bottom:12px}
 .card h2{font-size:12px;margin:0 0 8px;color:#8b949e;text-transform:uppercase;letter-spacing:.05em}
 img{width:100%;border-radius:6px;display:block;background:#000}
+.camwrap{position:relative;line-height:0}
+.camwrap canvas{position:absolute;left:0;top:0;width:100%;height:100%;pointer-events:none}
 .bars{display:flex;gap:8px;align-items:flex-end;height:120px}
 .bar{flex:1;display:flex;flex-direction:column;justify-content:flex-end;align-items:center;gap:4px}
 .bar .fill{width:100%;border-radius:4px 4px 0 0;transition:height .15s,background .15s}
@@ -200,7 +203,9 @@ pre{background:#010409;border:1px solid #30363d;border-radius:6px;padding:8px;he
 <div id=health class=health><span class=chip>health…</span></div>
 <div class=wrap>
   <div class=col>
-    <div class=card><h2>camera</h2><img id=cam src="/frame.jpg" alt="camera"></div>
+    <div class=card><h2>camera <span id=camnote class=hint></span></h2>
+      <div class=camwrap><img id=cam src="/frame.jpg" alt="camera"><canvas id=ov></canvas></div>
+    </div>
     <div class=card><h2>manual drive (armed only · each press = a short nudge)</h2>
       <div class=pad>
         <button class=dbtn data-d=forward title="forward (↑)">▲</button>
@@ -319,7 +324,36 @@ function poll(){
       document.getElementById("fps").textContent=(s.fps||0).toFixed(0)+" fps";
       var t=s.target||{};document.getElementById("target").textContent=t.active?(t.lost?"lost":("bearing "+(t.bearing||0).toFixed(2))):"none";
     }
+    drawOverlay(s);
   }).catch(function(){document.getElementById("conn").textContent="● no data";document.getElementById("conn").style.color="#f85149";});
+}
+// ---- bounding-box overlay on the camera: green = live tracker lock, cyan = what find_it/Claude just saw ----
+var LOCATE_SHOW_SECS=8;   // the Claude box is only valid for its capture frame; hide once it's stale
+function boxOn(ctx,cw,ch,b,color,label){
+  var x=b[0]*cw,y=b[1]*ch,w=b[2]*cw,h=b[3]*ch;
+  ctx.lineWidth=2;ctx.strokeStyle=color;ctx.strokeRect(x,y,w,h);
+  if(label){ctx.font="12px ui-monospace,monospace";var tw=ctx.measureText(label).width+8;
+    var ly=y>16?y-16:y+2;ctx.fillStyle=color;ctx.fillRect(x,ly,tw,15);
+    ctx.fillStyle="#0d1117";ctx.fillText(label,x+4,ly+11);}
+}
+function drawOverlay(s){
+  var cam=document.getElementById("cam"),ov=document.getElementById("ov"),note=document.getElementById("camnote");
+  var cw=cam.clientWidth,ch=cam.clientHeight;if(!cw||!ch)return;
+  if(ov.width!==cw)ov.width=cw;if(ov.height!==ch)ov.height=ch;
+  var ctx=ov.getContext("2d");ctx.clearRect(0,0,cw,ch);
+  var msg="";
+  // live tracker lock (green) — follows the object frame to frame
+  var t=s.target||{};
+  if(t.active&&!t.lost&&t.box){boxOn(ctx,cw,ch,t.box,"#3fb950","lock");}
+  // last find_it result (cyan) — the box Claude reported, only fresh for a few seconds
+  var lc=s.locate;
+  if(lc){var age=(Date.now()/1000)-(lc.ts||0);
+    if(age<LOCATE_SHOW_SECS){
+      if(lc.found&&lc.box){boxOn(ctx,cw,ch,lc.box,"#39d0d8",(lc.thing||"target")+(lc.locked?" ✓lock":" seen"));}
+      else if(!lc.found){msg="looked for “"+(lc.thing||"?")+"” — not seen";}
+    }
+  }
+  note.textContent=msg;note.style.color="#e3b341";
 }
 setInterval(poll,300);setInterval(tail,500);
 setInterval(function(){document.getElementById("cam").src="/frame.jpg?t="+Date.now();},300);
@@ -434,6 +468,11 @@ class H(BaseHTTPRequestHandler):
                         st["sonar"] = json.load(f)      # {ts, cm, valid}
                 except Exception:
                     st["sonar"] = None
+                try:
+                    with open(LOCATE) as f:
+                        st["locate"] = json.load(f)     # {ts, thing, found, box, locked}
+                except Exception:
+                    st["locate"] = None
                 st["voice"] = "on" if voice_on() else "off"
                 self._send(200, "application/json", json.dumps(st).encode())
             elif u.path == "/health":
