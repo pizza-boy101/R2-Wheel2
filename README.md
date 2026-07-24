@@ -10,6 +10,9 @@ something is in front of it, and drives itself around things instead of into the
 This is a personal side project I built in my own time. It isn't affiliated with anyone I
 work for.
 
+**Want to actually build and run it?** There's a step-by-step tutorial in [SETUP.md](SETUP.md).
+The rest of this README is about what it does and how it works.
+
 ## What it can do right now
 
 You talk and it drives. I connected it to the OpenAI Realtime API, so you can say something
