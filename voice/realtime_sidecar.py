@@ -95,7 +95,8 @@ NAV_FRESH = float(env("NAV_FRESH", "0.6"))                   # treat perception'
                                                              # frozen depth frame (perception stalled/crashed) halts the
                                                              # drive loops instead of steering blind on a stale picture
 # go_to (drive to a locked visual target): steer to keep it centred, skirt obstacles, stop on the sonar.
-GOTO_MAX_SECS = float(env("GOTO_MAX_SECS", "45"))             # safety cap on one homing run (Claude-per-step is slower)
+GOTO_MAX_SECS = float(env("GOTO_MAX_SECS", "60"))             # safety cap so it can't drive forever if it can't reach
+                                                             # the thing; Claude-per-step is slow so give it room
 GOTO_LOST_SECS = float(env("GOTO_LOST_SECS", "1.2"))          # tracker 'lost' this long -> give up, ask to re-find
 GOTO_BEAR_DEAD = float(env("GOTO_BEAR_DEAD", "0.10"))         # tight 'centred' band used up CLOSE (precise final aim)
 GOTO_BEAR_DEAD_FAR = float(env("GOTO_BEAR_DEAD_FAR", "0.22"))  # loose band when far/small: if the thing's roughly ahead,
@@ -114,11 +115,13 @@ GOTO_RELOCK_MAX_FAILS = int(env("GOTO_RELOCK_MAX_FAILS", "2"))  # give up only a
 # pulsed homing: drive in short bursts and PAUSE between them so the tracker reads a sharp frame, instead
 # of trying to track through continuous motion blur (which was making it lose the object while approaching).
 GOTO_PULSE_DRIVE = float(env("GOTO_PULSE_DRIVE", "0.45"))    # forward burst length — longer so it closes distance
-GOTO_PULSE_TURN = float(env("GOTO_PULSE_TURN", "0.12"))      # MAX centring turn burst; scaled down near centre so a
+GOTO_PULSE_TURN = float(env("GOTO_PULSE_TURN", "0.10"))      # MAX centring turn burst; scaled down near centre so a
                                                              # single step never swings past where the (1-2s old) box
                                                              # said the thing was -> no chasing the 'afterimage'
 GOTO_PULSE_TURN_MIN = float(env("GOTO_PULSE_TURN_MIN", "0.06"))  # floor so a tiny turn still actually moves the wheels
-GOTO_HOME_TURN_SPEED = float(env("GOTO_HOME_TURN_SPEED", "0.6"))  # gentle turn (motor floor) so centring doesn't overshoot
+GOTO_HOME_TURN_SPEED = float(env("GOTO_HOME_TURN_SPEED", "1.0"))  # FULL speed: a short low-speed pulse can't overcome
+                                                                 # the wheels' static friction (it just doesn't move) —
+                                                                 # a crisp full-speed flick for a tiny time actually nudges
 GOTO_PULSE_SETTLE = float(env("GOTO_PULSE_SETTLE", "0.45"))  # stop-and-look pause: let motion stop AND a fresh frame land
                                                              # before Claude looks, so it reads NOW, not a frame ago
 GOTO_KP = float(env("GOTO_KP", "2.2"))                        # bearing -> turn-rate gain (proportional steering)
@@ -556,6 +559,8 @@ async def guarded_home(speed, enqueue):
                 # finds the thing or says not-found; it never hands back a random jump. We still re-seed
                 # the tracker from Claude's box so the dashboard overlay stays honest.
                 box = await to_thread(call_locator, label)
+                size = 0.0
+                box_bottom = 0.0
                 if box is not None:
                     # got a fresh fix -> steer on it, and remember it to coast on if the next look misses
                     fails = 0
@@ -590,6 +595,8 @@ async def guarded_home(speed, enqueue):
                     centered = abs(bearing) < GOTO_BEAR_DEAD_FAR   # blind: coast forward toward where we last saw it
                                                                    # unless it was clearly off to a side
 
+                log("go_to: %s bear=%+.2f centred=%s size=%.3f bot=%.2f ucm=%s" % (
+                    "SEE" if box is not None else "blind", bearing, centered, size, box_bottom, ucm))
                 blocked = (c >= avoid.STOP_NEAR or l >= avoid.SIDE_NEAR
                            or r >= avoid.SIDE_NEAR or loom >= avoid.LOOM_BRAKE)
                 # PULSED move toward CLAUDE's bearing: one short, timed burst then a pause. The burst
