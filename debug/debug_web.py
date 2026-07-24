@@ -40,7 +40,8 @@ _chatsock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
 MOTOR_SOCK = os.path.join(WORKSPACE, "motor.sock") # manual d-pad nudges -> motor daemon (it enforces DISARM)
 _motorsock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
 BATTERY = os.path.join(WORKSPACE, "battery.json")  # optional pack-voltage telemetry (shown only if present)
-NUDGE_SPEED = float(os.environ.get("DEBUG_NUDGE_SPEED", "0.5"))   # manual-drive nudge speed
+NUDGE_SPEED = float(os.environ.get("DEBUG_NUDGE_SPEED", "1.0"))   # manual-drive nudge speed (full: strafing on
+                                                                 # mecanum wheels needs more push than driving straight)
 NUDGE_SECS = float(os.environ.get("DEBUG_NUDGE_SECS", "0.4"))     # ...and how long each press drives for
 # d-pad label -> motor-daemon direction. left/right = strafe (mecanum), cw/ccw = rotate.
 DRIVE_DIRS = {"forward": "forward", "back": "back", "cw": "cw", "ccw": "ccw",
