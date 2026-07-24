@@ -26,6 +26,8 @@ ROBOT = os.path.join(HOME, "robot")
 WORKSPACE = os.path.join(ROBOT, "workspace")
 NAV_STATE = os.path.join(WORKSPACE, "nav_state.json")
 FRAME = os.path.join(WORKSPACE, "frame.jpg")
+FAST_FRAME = os.path.join(WORKSPACE, "frame_fast.jpg")   # small high-rate frame -> smooth MJPEG video feed
+STREAM_FPS = float(os.environ.get("DEBUG_STREAM_FPS", "20"))
 DISARM = os.path.join(WORKSPACE, ".disarmed")
 ULTRA = os.path.join(WORKSPACE, "ultrasonic.json")   # forward distance, published by motor daemon
 LOCATE = os.path.join(WORKSPACE, "locate.json")      # find_it's last result (the box Claude reported)
@@ -204,7 +206,8 @@ pre{background:#010409;border:1px solid #30363d;border-radius:6px;padding:8px;he
 <div id=health class=health><span class=chip>health…</span></div>
 <div class=wrap>
   <div class=col>
-    <div class=card><h2>camera <span id=camnote class=hint></span></h2>
+    <div class=card><h2>camera <span id=camnote class=hint></span>
+      <button id=vidBtn class=btn style="float:right;padding:1px 10px;font-size:11px">⚡ smooth video</button></h2>
       <div class=camwrap><img id=cam src="/frame.jpg" alt="camera"><canvas id=ov></canvas></div>
     </div>
     <div class=card><h2>manual drive (armed only · each press = a short nudge)</h2>
@@ -262,7 +265,7 @@ pre{background:#010409;border:1px solid #30363d;border-radius:6px;padding:8px;he
   <pre id=log></pre>
 </div></div>
 <script>
-var cur="voice", pos={voice:0,nav:0,motor:0,perception:0}, atBottom=true, disarmed=true, voiceOn=false;
+var cur="voice", pos={voice:0,nav:0,motor:0,perception:0}, atBottom=true, disarmed=true, voiceOn=false, streaming=false;
 var logEl=document.getElementById("log");
 function setArm(which){
   fetch("/"+which,{method:"POST"}).then(r=>r.json()).then(function(d){disarmed=!!d.disarmed;poll();}).catch(function(){});
@@ -351,7 +354,13 @@ function drawOverlay(s){
   note.textContent=msg;note.style.color="#e3b341";
 }
 setInterval(poll,300);setInterval(tail,500);
-setInterval(function(){document.getElementById("cam").src="/frame.jpg?t="+Date.now();},300);
+setInterval(function(){if(!streaming)document.getElementById("cam").src="/frame.jpg?t="+Date.now();},300);
+// smooth video toggle: swap the still-frame poll for the MJPEG stream (for easier remote driving)
+document.getElementById("vidBtn").onclick=function(){
+  streaming=!streaming;var cam=document.getElementById("cam");
+  if(streaming){cam.src="/stream.mjpg";this.textContent="◼ stop video";this.classList.add("stop");}
+  else{this.textContent="⚡ smooth video";this.classList.remove("stop");cam.src="/frame.jpg?t="+Date.now();}
+};
 // ---- chat: type to the bot; replies (its spoken transcript) show here too ----
 var chatLogEl=document.getElementById("chatlog"), chatBottom=true;
 chatLogEl.addEventListener("scroll",function(){chatBottom=chatLogEl.scrollHeight-chatLogEl.scrollTop-chatLogEl.clientHeight<40;});
@@ -478,6 +487,34 @@ class H(BaseHTTPRequestHandler):
                         self._send(200, "image/jpeg", f.read())
                 except Exception:
                     self._send(404, "text/plain", b"no frame")
+            elif u.path == "/stream.mjpg":
+                # smooth ~20fps MJPEG feed for teleop: loop-serve the small frame_fast.jpg as a
+                # multipart stream. ThreadingHTTPServer runs this in its own thread, so the long-lived
+                # connection doesn't block other endpoints. Ends when the browser closes the tab.
+                self.send_response(200)
+                self.send_header("Cache-Control", "no-store, no-cache, must-revalidate")
+                self.send_header("Connection", "close")
+                self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
+                self.end_headers()
+                period = 1.0 / STREAM_FPS if STREAM_FPS > 0 else 0.05
+                last = None
+                try:
+                    while True:
+                        try:
+                            with open(FAST_FRAME, "rb") as f:
+                                data = f.read()
+                        except Exception:
+                            data = None
+                        if data and data != last:            # only push changed frames
+                            self.wfile.write(b"--frame\r\nContent-Type: image/jpeg\r\n")
+                            self.wfile.write(("Content-Length: %d\r\n\r\n" % len(data)).encode())
+                            self.wfile.write(data)
+                            self.wfile.write(b"\r\n")
+                            last = data
+                        time.sleep(period)
+                except (BrokenPipeError, ConnectionResetError, OSError):
+                    pass                                     # viewer closed the stream
+                return
             elif u.path == "/tail":
                 q = parse_qs(u.query)
                 name = (q.get("f", ["nav"])[0])

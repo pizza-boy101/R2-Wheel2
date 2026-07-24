@@ -56,6 +56,7 @@ MODEL = os.path.join(HOME, "robot", "models", "model-small.onnx")
 ENGINE = os.path.join(HOME, "robot", "models", "midas-small-fp16.trt")   # TensorRT FP16 (preferred)
 WORKSPACE = env("ROBOT_WORKSPACE", os.path.join(HOME, "robot", "workspace"))
 FRAME_OUT = os.path.join(WORKSPACE, "frame.jpg")      # we now PRODUCE this (was vision_sidecar's job)
+FAST_OUT = os.path.join(WORKSPACE, "frame_fast.jpg")  # small, high-rate frame for the dashboard's smooth video feed
 STATE = os.path.join(WORKSPACE, "nav_state.json")
 GOAL = os.path.join(WORKSPACE, "nav_goal.json")
 
@@ -71,6 +72,9 @@ CAM_WIDTH = int(env("CAM_WIDTH", "1280"))
 CAM_HEIGHT = int(env("CAM_HEIGHT", "720"))
 FRAME_WRITE_EVERY = float(env("FRAME_WRITE_EVERY", "0.25"))
 FRAME_QUALITY = int(env("FRAME_QUALITY", "80"))
+FAST_WRITE_EVERY = float(env("FAST_WRITE_EVERY", "0.05"))    # ~20 fps small frame for the smooth teleop video feed
+FAST_MAXDIM = int(env("FAST_MAXDIM", "640"))                 # downscaled long edge (bandwidth-friendly)
+FAST_QUALITY = int(env("FAST_QUALITY", "55"))
 LOG_EVERY = float(env("PERCEPTION_LOG_EVERY", "0.5"))
 BAND_TOP = float(env("PERCEPTION_BAND_TOP", "0.30"))   # look AHEAD (mid frame), not the floor at the wheels
 BAND_BOT = float(env("PERCEPTION_BAND_BOT", "0.62"))
@@ -310,6 +314,7 @@ def main():
     period = 1.0 / FPS_CAP if FPS_CAP > 0 else 0.0
     last_log = 0.0
     last_frame_write = 0.0
+    last_fast_write = 0.0
     ema_fps = 0.0
     read_ema = 0.0                            # camera read() time (high => buffer lag / camera-bound)
     infer_ema = 0.0                           # depth inference time
@@ -432,6 +437,17 @@ def main():
             if okj:
                 atomic_write(FRAME_OUT, buf.tobytes(), binary=True)
             last_frame_write = time.time()
+
+        # small, high-rate frame for the dashboard's smooth video feed (teleop). Cheap encode.
+        if time.time() - last_fast_write >= FAST_WRITE_EVERY:
+            fh, fw = img.shape[:2]
+            fscale = FAST_MAXDIM / float(max(fh, fw))
+            fimg = cv2.resize(img, (int(fw * fscale), int(fh * fscale)),
+                              interpolation=cv2.INTER_AREA) if fscale < 1.0 else img
+            okf, fbuf = cv2.imencode(".jpg", fimg, [cv2.IMWRITE_JPEG_QUALITY, FAST_QUALITY])
+            if okf:
+                atomic_write(FAST_OUT, fbuf.tobytes(), binary=True)
+            last_fast_write = time.time()
 
         if time.time() - last_log >= LOG_EVERY:
             last_log = time.time()
