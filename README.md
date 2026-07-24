@@ -22,10 +22,11 @@ there" it rolls off and steers around whatever's in the way. It replies out loud
 second, and you can talk over it and it will stop and listen.
 
 It sees. There's a depth model running on the Jetson's GPU that works out roughly how far
-away things are from a single camera, about 29 times a second. So it has a real sense of
-"wall on the left, open space ahead." It also watches how fast the picture is swelling as it
-moves, which is a second way to tell something is rushing up even when the distance guess is
-unreliable.
+away things are from a single camera. The model itself is quick (tens of milliseconds a frame);
+the whole see-and-publish loop lands around a dozen times a second, which is plenty for reacting.
+So it has a real sense of "wall on the left, open space ahead." It also watches how fast the
+picture is swelling as it moves, which is a second way to tell something is rushing up even when
+the distance guess is unreliable.
 
 It also feels. I added a little ultrasonic distance sensor pointing straight ahead, under the
 camera. Unlike the camera it gives a real measurement in centimetres, and because it uses sound
@@ -38,17 +39,22 @@ robot reads the depth about twenty times a second and picks a move: go straight 
 ahead is clear, and turn toward the more open side when something gets close. So you can point
 it at a cluttered bit of floor and it threads through instead of stopping dead or crashing.
 
-It can hunt for things and go to them. Ask it to find something and it turns in small, paced
-steps, taking a photo at each one, until the thing is clearly and fully in view. Then it locks
-on: a tracker on the robot follows that thing frame by frame, and the car drives to it on its
-own — keeping it centred, steering around whatever's in the way, and stopping just short. If it
-loses sight of it, it says so and looks again rather than wandering off blind.
+It can find a specific thing and drive to it. Say "find the red mug and go to it" and it runs
+the whole job by itself. The quick voice model is bad at spotting a small object across a room,
+so it hands the camera view to a stronger vision model (Claude), which finds the thing wherever
+it is in the frame and draws a box around it. It's open-vocabulary — you can name almost
+anything, there's no fixed list of objects and nothing to train. Then it drives there on its own:
+turns to face it, closes the distance (dashing straight when the way ahead is clearly open, to
+save time), re-checks with that sharper eye as it gets close, steers around obstacles, and stops
+right at it. If it loses sight of it, it re-finds it instead of wandering off blind. Getting this
+to work honestly took the most iteration of anything here (see the limitations below for why).
 
 It thinks harder when it's stuck. The voice is quick but not a great planner, so when it gets
 genuinely stuck — a full spin turns up nothing, or it's boxed into a tight corner — it hands the
-situation to a stronger model for a moment and gets back a short plan ("back out, then check both
-sides, then head for the opening"), which it then carries out. It's the same split-brain idea one
-layer up: something fast for talking, something slower and smarter for thinking.
+situation to a stronger model (Claude again) for a moment, along with the current camera view, and
+gets back a short plan ("back out, then check both sides, then head for the opening") grounded in
+what it can actually see, which it then carries out. It's the same split-brain idea one layer up:
+something fast for talking, something slower and smarter for looking and thinking.
 
 It tries not to hurt itself or me. One program owns the link to the motors and keeps
 re-sending the current command faster than the firmware's timeout, so motion stays smooth;
@@ -61,12 +67,15 @@ My first instinct was to just send the camera feed to the cloud AI and let it dr
 does not work. There's about a one second round trip, so the car decides to stop roughly a
 meter after it should have, and streaming video to the cloud is slow and expensive.
 
-So I split the brain into two parts running at two different speeds. The cloud part is slow,
-around one second, and it handles understanding what you want and deciding the goal. The
-part running on the robot itself is fast, around twenty frames a second, and it handles the
-reflexes: not driving into things, and steering around them. The camera and the navigation
-never leave the robot. The cloud decides what to do, and the robot handles not crashing. That
-split is basically the whole trick.
+So I split the brain into parts running at different speeds. The fast part runs on the robot
+itself, around a dozen times a second, and handles the reflexes: not driving into things, and
+steering around them. It never talks to the cloud — the camera and the navigation stay local. On
+top of that sit two cloud brains at two different speeds: a quick voice model (OpenAI's Realtime
+API, ~1s) that listens, talks, and decides the goal; and a slower, sharper model (Claude, ~1-2s)
+that does the things the quick one is bad at — finding a specific named object in the frame and
+drawing a box on it, and thinking through a plan when the robot is stuck. Fast reflexes for not
+crashing, a fast talker for conversation, a slow careful eye for the hard seeing and planning.
+Picking the right speed for each job is basically the whole trick.
 
 ## The parts
 
@@ -126,13 +135,16 @@ it ever gets physically wedged on something the camera couldn't see, it backs up
 free itself.
 
 For talking, realtime_sidecar.py opens one connection to the OpenAI Realtime API and streams
-the microphone up and the voice down. The AI drives through a few tools: a plain drive for
-little nudges, look to take a photo, stop, and two ways of going forward. Advance rolls up to
-something and stops before it reaches it; navigate rolls off and steers around obstacles.
-Keeping those two separate turned out to matter, because "come here and stop" and "go explore"
-want opposite things when there's a wall in front. One bug that took me a while: I was doing
-the image processing on the same thread as the audio, and it made the voice stutter. Moving
-that work to a background thread fixed it.
+the microphone up and the voice down. The AI drives through a handful of tools: a plain drive
+for little nudges (turn_left/turn_right rotate in place, strafe_left/strafe_right slide sideways
+— naming them that way stopped it strafing when I said "turn"), look to take a photo, stop, two
+ways of going forward, and the find-and-fetch pair. Advance rolls up to something and stops
+before it reaches it; navigate rolls off and steers around obstacles — keeping those two separate
+turned out to matter, because "come here and stop" and "go explore" want opposite things when
+there's a wall in front. find_it hands the frame to Claude to locate a named object; go_to then
+drives to whatever's locked. scan turns a step at a time to search; think asks Claude for a plan
+when stuck. One bug that took me a while: I was doing the image processing on the same thread as
+the audio, and it made the voice stutter. Moving that work to a background thread fixed it.
 
 ## Watching it
 
@@ -143,10 +155,14 @@ it's armed, and a running tail of each log, plus an arm/disarm button and an esc
 switch. Across the top there's a health strip that tells me at a glance whether each of the
 robot's programs is actually running, how fresh the camera / depth / distance readings are, and
 how hot the board is getting — which turns "why isn't it reacting" from an SSH archaeology dig
-into a look. There's a little d-pad too, so I can nudge it around with the arrow keys when I
+into a look. When it's locked onto something, the box the vision model drew is overlaid on the camera view,
+so I can see exactly what it thinks it's chasing (this is how I caught it once "locking on" to me
+instead of the ball). There's a little d-pad, so I can nudge it around with the arrow keys when I
 just want to reposition it by hand, and a chat box for typing to it when saying things out loud
-isn't practical (its replies show up there). It's plain Python with no extra dependencies, so
-it just runs.
+isn't practical (its replies show up there). The camera view is a cheap few-frames-a-second still
+by default, but there's a "smooth video" toggle that switches to a live MJPEG stream when I want
+to drive it around by hand more easily. It's plain Python with no extra dependencies, so it just
+runs.
 
 ## Stuff that went wrong
 
@@ -167,6 +183,43 @@ storage tub. It took me a while to realize the depth model was seeing right thro
 plastic to the wall behind, so as far as the robot was concerned there was nothing there.
 That's what pushed me to add the "how fast is the picture growing" cue, which doesn't care
 whether it can actually measure the distance.
+
+## What it's bad at (the honest limits)
+
+I got this about as far as the hardware and a hobby budget let me. The things it can't do are
+mostly baked into the parts, not bugs I can patch:
+
+- **No sense of angle or distance travelled.** There's no compass, no gyro, no wheel encoders, so
+  the motors are open-loop: it can't turn a known number of degrees or drive a known distance. It
+  nudges and re-checks instead. It also means it drifts when driving straight, which I correct with
+  a fixed per-wheel trim — but that trim depends on the battery level and the floor surface, so a
+  fresh calibration goes off as the pack drains.
+- **Reflexes are about a dozen times a second, not thirty.** The depth model infers fast, but the
+  full loop (grab, infer, optical flow, write out the state and frames) lands around 12 Hz. Fine
+  for an indoor toy car; it's not dodging anything quick.
+- **One camera, so depth is a guess.** A single camera can't truly measure distance, and it's blind
+  to glass and clear plastic (it sees straight through). The optical-flow "is the picture growing"
+  cue and the ultrasonic cover for that, but it's why arrival is decided by the sonar and the
+  object's size/position in frame, never by the camera depth — mounted low, the camera reads the
+  near floor as "close," which would otherwise fake "I've arrived" while the target's still far.
+- **One forward ultrasonic.** It only ranges dead ahead, in a narrow cone, and small low things (a
+  ball on the floor) often don't echo it at all — so the sonar can't be trusted to tell it where a
+  ball is, only whether a wall-sized thing is close. No side or rear distance sensing.
+- **"Go to that thing" leans on the cloud, so it's careful, not fast.** The on-board tracker is
+  quick but unreliable — when the car turns, it silently latches onto whatever texture is where the
+  object used to be — so I don't let it steer. Instead each step asks Claude where the thing is
+  (~1-2s a look) and drives a short hop toward that. It's deliberately move-a-little-then-look; it
+  reaches things reliably now, but it's not quick, and a fast-moving target will out-run it. (The
+  quick voice model, for its part, genuinely can't tell left from right in an image — that whole
+  saga is why Claude does the seeing.)
+- **The live video tops out around 12 fps too.** The camera can do 30, but Python's global lock
+  means the depth loop starves the frame grabber. A true 30 fps feed would need the capture in its
+  own process.
+- **Flaky wifi and a tired battery.** It runs headless over wifi that drops for a minute at a time,
+  and the small 12V motor pack sags under load — so sometimes it just goes quiet, and that's usually
+  power or network, not the code.
+- **No memory of the room.** It only reacts to what's in front of it right now. It doesn't build a
+  map or remember where anything is.
 
 ## Running it
 
@@ -195,16 +248,21 @@ any API keys are deliberately not in this repo (see .gitignore), so you bring yo
 voice needs an OpenAI key; the "think when stuck" planner needs an Anthropic one — both live in
 a secrets folder that isn't committed.
 
-## What I want to add next
+## What I'd add next (if I keep going)
 
-- Give it a sense of angle. Right now it has no compass and the motors are open-loop, so it
-  can't turn a known number of degrees — it just nudges and re-checks. A cheap gyro (an IMU)
-  would let it turn to an actual heading, which would tidy up searching and stop the little
-  overshoots.
-- Build a simple map of a room from a spin, so it can remember where the openings and things
-  are instead of only reacting to what's right in front of it. The angle sense above is the
-  missing piece for this.
-- Keep making "go to that specific thing" more robust — the lock-on tracker works, but it can
-  still lose a target while squeezing past an obstacle and has to look again.
+I've taken this about as far as the current parts allow, so the next steps are mostly about
+lifting the hardware/software ceilings in the limitations above:
+
+- Give it a sense of angle — a cheap gyro (an IMU). This is the single biggest unlock: with a real
+  heading it could turn a known number of degrees instead of nudge-and-recheck, which would tidy up
+  searching, kill the drift, and make almost everything else easier. (I couldn't get one for this
+  build.)
+- Take the cloud out of the "find it" loop. Finding an object is a ~1-2s Claude look every step,
+  which is why "go to it" is stop-start. A small on-board object detector — or just moving the
+  frame-grab and locator into their own process to dodge the GIL — would let it find and chase
+  things quickly and smoothly.
+- A couple more ultrasonics for side coverage, and (with the IMU) a simple map of a room from a
+  spin, so it remembers where the openings and things are instead of only reacting to what's dead
+  ahead.
 
 Thanks for reading. This has been the most fun I've had learning something in a while.

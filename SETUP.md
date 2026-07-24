@@ -96,6 +96,12 @@ running (next section) with `motor/move` and `motor/testwheel`.
 If the car drifts to one side when driving straight, nudge the `TRIM[]` values (1.0 = full power;
 lower = slower) — slow down the wheels on the side that's outrunning the other, then re-flash.
 
+One software calibration to do once the car can drive: the "go to it" behaviour dashes straight on
+clear stretches, and its safety distance-cap assumes a rough top speed. Measure it — command full
+speed forward for a known time, measure how far it went — and set `GOTO_DASH_SPEED_CMS` (an env var
+read by the voice sidecar) at or a little **above** that cm/s. Keeping it high makes the dash
+over-estimate its travel and stop early, which is the safe direction.
+
 ---
 
 ## 5. Install the Python bits
@@ -183,7 +189,10 @@ done.
 
 **Then talk to it:** hit **voice on** in the dashboard (it opens the mic + the paid Realtime API),
 and try "move forward for a second", "come here and stop when you're close", or "find the red mug and
-go to it". You can also type to it in the dashboard's chat box.
+go to it". You can also type to it in the dashboard's chat box. When it's found and locked onto
+something, the box it's tracking is drawn on the camera view — handy for checking it locked onto the
+right thing. For smoother hand-driving there's a **"smooth video"** toggle above the camera that
+switches the low-rate still for a live stream.
 
 ---
 
