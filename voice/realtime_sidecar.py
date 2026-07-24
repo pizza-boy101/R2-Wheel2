@@ -95,7 +95,7 @@ NAV_FRESH = float(env("NAV_FRESH", "0.6"))                   # treat perception'
                                                              # frozen depth frame (perception stalled/crashed) halts the
                                                              # drive loops instead of steering blind on a stale picture
 # go_to (drive to a locked visual target): steer to keep it centred, skirt obstacles, stop on the sonar.
-GOTO_MAX_SECS = float(env("GOTO_MAX_SECS", "30"))             # safety cap on one homing run
+GOTO_MAX_SECS = float(env("GOTO_MAX_SECS", "45"))             # safety cap on one homing run (Claude-per-step is slower)
 GOTO_LOST_SECS = float(env("GOTO_LOST_SECS", "1.2"))          # tracker 'lost' this long -> give up, ask to re-find
 GOTO_BEAR_DEAD = float(env("GOTO_BEAR_DEAD", "0.10"))         # |bearing| under this = centred enough
 # self-healing lock: while homing, use Claude (the strong eye) to keep the dumb CSRT tracker honest —
@@ -513,15 +513,12 @@ async def guarded_home(speed, enqueue):
     cancelled = False
     reason = "I couldn't get to it"
     start = time.monotonic()
-    lost_since = None
-    label = read_goal_label() or "the target"     # what we're chasing, for background re-locates
-    relock_task = None                             # in-flight background Claude re-locate (never blocks the loop)
-    last_relock = start
-    relock_fails = 0
+    label = read_goal_label() or "the target"     # what find_it locked; what we re-find each step
+    fails = 0
     try:
         tg = read_target()
         if not (tg and tg.get("active")):
-            reason = "I don't have a lock — get it in view and lock onto it first"
+            reason = "I don't have a lock — find it and lock onto it first"
         else:
             while True:
                 now = time.monotonic()
@@ -532,63 +529,44 @@ async def guarded_home(speed, enqueue):
                 st = read_nav_state()
                 if st is None:
                     reason = "I lost the camera feed"; break
-                tg = st.get("target") or {}
-                if not tg.get("active"):
-                    reason = "I lost the lock"; break
                 n = st.get("near", {}) or {}
                 l, c, r = n.get("l", 0), n.get("c", 0), n.get("r", 0)
                 loom = st.get("loom", 0) or 0
                 ucm, uvalid = read_ultra()
 
-                # ---- self-healing lock: keep a background Claude re-locate in flight and, when it
-                # lands, re-seed the tracker if it has drifted off the thing or lost it. Claude is the
-                # honest eye; the CSRT tracker is just the fast glue between re-locates. Never blocks. ----
-                if relock_task is not None and relock_task.done():
-                    try:
-                        rbox = relock_task.result()
-                    except Exception:
-                        rbox = None
-                    relock_task = None
-                    if rbox is not None:
-                        relock_fails = 0
-                        cur_box = tg.get("box") if (tg.get("active") and not tg.get("lost")) else None
-                        if cur_box is None or box_center_dist(rbox, cur_box) >= GOTO_RELOCK_DRIFT:
-                            seed_box(rbox, label)                 # snap the tracker back onto the real thing
-                            write_locate(label, True, rbox, True)  # dashboard shows the correction
-                            log("go_to: re-locked on %s" % label)
-                            lost_since = None                      # fresh lock -> reset the give-up clock
-                    else:
-                        relock_fails += 1                          # Claude couldn't see it this time
-                        write_locate(label, False, None, False)
-                if (tg.get("lost") or (now - last_relock) >= GOTO_RELOCK_EVERY) and relock_task is None:
-                    last_relock = now
-                    relock_task = asyncio.create_task(to_thread(call_locator, label))
-
-                # lost sight: don't quit on a blip — a re-locate is already in flight above. Give up only
-                # once it's been lost a while AND Claude also can't re-find it.
-                if tg.get("lost"):
-                    lost_since = now if lost_since is None else lost_since
-                    if now - lost_since > GOTO_LOST_SECS and relock_fails >= GOTO_RELOCK_MAX_FAILS:
+                # CLAUDE-AUTHORITATIVE steering. The car is stopped here (the previous burst has
+                # expired), so this frame is SHARP. We ask Claude where the thing is and steer on THAT,
+                # never the CSRT tracker: the tracker can't follow the scene panning during a turn — it
+                # silently re-latches on random texture and its bearing spins the car. Claude either
+                # finds the thing or says not-found; it never hands back a random jump. We still re-seed
+                # the tracker from Claude's box so the dashboard overlay stays honest.
+                box = await to_thread(call_locator, label)
+                if box is None:
+                    fails += 1
+                    write_locate(label, False, None, False)
+                    if avoid.ultra_blocked(ucm, uvalid):
+                        reason = "I'm right up next to it"; break   # too close to box it -> we've arrived
+                    if fails >= GOTO_RELOCK_MAX_FAILS:
                         reason = "I lost it and couldn't re-find it"; break
                     motor("stop")
-                    await asyncio.sleep(0.05); continue
-                lost_since = None
-                relock_fails = 0                                   # tracking fine -> only consecutive-while-lost fails count
-
-                bearing = tg.get("bearing", 0.0)
+                    await asyncio.sleep(GOTO_PULSE_SETTLE); continue
+                fails = 0
+                seed_box(box, label)
+                write_locate(label, True, box, True)
+                bearing = (box[0] + box[2] / 2.0) - 0.5       # Claude's pixel bearing: - = left, + = right
+                size = box[2] * box[3]
                 centered = abs(bearing) < GOTO_BEAR_DEAD
-                # arrived: it's centred AND right in front (sonar standoff, camera block, or it fills
-                # the frame). The centred test is what stops a side wall reading as 'arrived'.
+                # arrived: centred AND right in front (sonar standoff, camera block, or it fills the frame)
                 if centered and (avoid.ultra_blocked(ucm, uvalid) or c >= avoid.STOP_NEAR
-                                 or tg.get("size", 0) >= GOTO_SIZE_ARRIVE):
+                                 or size >= GOTO_SIZE_ARRIVE):
                     reason = "I'm right up next to it"; break
 
                 blocked = (c >= avoid.STOP_NEAR or l >= avoid.SIDE_NEAR
                            or r >= avoid.SIDE_NEAR or loom >= avoid.LOOM_BRAKE)
-                # PULSED homing: one short, timed burst then a pause. The burst self-expires at the
-                # daemon, so during the settle the car is stopped and the next frame is SHARP — that's
-                # the frame the tracker reads. This 'move a little, pause, look' beats trying to track
-                # through continuous motion blur, which was losing the object during the approach.
+                # PULSED move toward CLAUDE's bearing: one short, timed burst then a pause. The burst
+                # self-expires at the daemon, so by the top of the next loop the car is stopped and the
+                # frame is SHARP for Claude's next look. 'Move a little, pause, look again' — no steering
+                # on a tracker that lies mid-turn, and no driving through blur.
                 if blocked and not centered:
                     # obstacle ahead while the target is off to a side -> skirt toward the more open side
                     act, _ = avoid.decide(l, c, r, loom, None, 0.0, now)
@@ -613,8 +591,6 @@ async def guarded_home(speed, enqueue):
         raise
     finally:
         motor("stop")
-        if relock_task is not None and not relock_task.done():
-            relock_task.cancel()                    # don't leave a background re-locate dangling
         if not cancelled:
             clear_goal()                            # terminal end -> drop the lock
         log("go_to stopped: %s" % ("cancelled" if cancelled else reason))
