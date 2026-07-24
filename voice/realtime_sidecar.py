@@ -177,9 +177,14 @@ INSTRUCTIONS = (
     "saw it on one side, scan that way. Look at each photo; if what you're after isn't in it, scan again, "
     "step by step (a full turn is several scans). Getting it CLEARLY in view AND centered matters: if it "
     "first shows up as just a sliver at the edge of the frame, you've only caught the very start of it — do "
-    "NOT act yet. Once it IS in view but sitting off to one side, switch to small centring nudges: scan with "
-    "amount 'center' toward that side, a touch at a time, reading each photo, until it sits in the middle of "
-    "the frame. Only THEN stop scanning and either say what it is or head toward it. Don't take big blind turns to "
+    "NOT act yet. Once it IS in view but sitting off to one side, switch to small centring nudges and turn "
+    "TOWARD THE THING — the SAME side it's on: if it's on the RIGHT of the frame, scan 'center' to the RIGHT; "
+    "if it's on the LEFT, scan 'center' to the LEFT. This is a plain rule — don't reason about which way the "
+    "picture slides, just turn toward the side the thing is on. It will usually mean REVERSING your sweep "
+    "direction, and that's correct: the keep-scanning-the-same-way rule is for searching, NOT for centring, so "
+    "drop it the moment the thing is in view. One nudge at a time, read the photo, repeat until it sits in the "
+    "middle; stop the instant it's centred so you don't overshoot past it. Only THEN either say what it is or "
+    "head toward it. Don't take big blind turns to "
     "search. Chain the scans yourself — scan, read the view, decide, scan again — without waiting to be "
     "prompted. IMPORTANT — don't give up early: a few steps only covers a small arc, and something behind "
     "you takes about half a full circle of steps to come into view. Keep scanning the SAME direction, step "
@@ -231,10 +236,10 @@ TOOLS = [
      "description": "Attach a fresh photo from the robot's forward camera so you can see the scene with your own eyes. Call before moving toward something or when asked what you see.",
      "parameters": {"type": "object", "properties": {}, "required": []}},
     {"type": "function", "name": "scan",
-     "description": "Look around for something. The FIRST scan of a search hands you the view from where you already are WITHOUT moving — look at it first. Each scan after that turns the car and hands you a fresh camera view, so calling scan again means 'I've looked at that view, keep going.' Two step sizes via amount: 'step' (default) turns about one camera-width so each new view picks up right where the last one ended — use this to sweep a room; 'center' turns just a hair — use this ONCE THE THING IS ALREADY IN VIEW but off to one side, scanning 'center' toward it (repeat if needed) until it sits in the middle of the frame, then lock on and go to it. Always read each photo and decide before scanning again. When sweeping, pick the direction deliberately toward where the thing should be. Never use big blind turns to search.",
+     "description": "Look around for something. The FIRST scan of a search hands you the view from where you already are WITHOUT moving — look at it first. Each scan after that turns the car and hands you a fresh camera view, so calling scan again means 'I've looked at that view, keep going.' Two step sizes via amount: 'step' (default) turns about one camera-width so each new view picks up right where the last one ended — use this to sweep a room; 'center' turns just a hair — use this ONCE THE THING IS ALREADY IN VIEW but off to one side: set direction to the SAME side the thing is on (on the right of the frame → direction right) and repeat a touch at a time until it sits in the middle, then lock on and go to it. Centring usually means reversing your sweep direction — do it anyway; the keep-the-same-direction habit is only for searching. Always read each photo and decide before scanning again. When sweeping, pick the direction deliberately toward where the thing should be. Never use big blind turns to search.",
      "parameters": {"type": "object", "properties": {
          "direction": {"type": "string", "enum": ["left", "right"],
-                       "description": "which way to turn — left or right (default right)"},
+                       "description": "which way to turn — left or right (default right). For a 'center' nudge, use the SAME side the target is on (target on the right of the frame → right)"},
          "amount": {"type": "string", "enum": ["step", "center"],
                     "description": "'step' = a full camera-width sweep step (default); 'center' = a tiny centring nudge for a target that's already in view but off to one side"}},
          "required": []}},
@@ -982,9 +987,10 @@ async def main():
                                     note = "kill switch is on — I can't nudge, but here's the current view"
                                     cap = "Current camera view (can't turn — kill switch on):"
                                 else:
-                                    note = ("nudged a hair %s to centre it. If it's centred now, lock on and go "
-                                            "to it (or say what it is); if it's still off to that side, scan "
-                                            "'center' %s again a touch." % (side, side))
+                                    note = ("nudged a hair %s. Look where the target is NOW: if it's centred, lock "
+                                            "on and go to it (or say what it is); if it's still off to a side, scan "
+                                            "'center' toward whichever side it's on now (right→right, left→left) — "
+                                            "stop the moment it's centred, don't overshoot." % side)
                                     cap = "Camera view after a small centring nudge %s:" % side
                             else:
                                 fresh_sweep = (now_m - prev_last) > SCAN_SWEEP_GAP
