@@ -287,7 +287,7 @@ TOOLS = [
          "speed": {"type": "number", "description": "0.6..1 (below 0.6 the motors stall), default 1"}},
          "required": []}},
     {"type": "function", "name": "think",
-     "description": "Ask a stronger reasoning model for a plan when you're stuck or a task needs real multi-step spatial planning — e.g. you've searched and can't find something, you're boxed into a tight space, or you must work out how to get somewhere around obstacles. Describe the situation and your goal; it hands back a short step-by-step plan that you then carry out with your other tools. Use it at genuine decision points, not for routine single moves.",
+     "description": "Ask a stronger reasoning model for a plan when you're stuck or a task needs real multi-step spatial planning — e.g. you've searched and can't find something, you're boxed into a tight space, or you must work out how to get somewhere around obstacles. It SEES the robot's current camera view, so it reasons about the actual space around you. Describe the situation and your goal; it hands back a short step-by-step plan that you then carry out with your other tools. Use it at genuine decision points, not for routine single moves (it takes a second or two).",
      "parameters": {"type": "object", "properties": {
          "situation": {"type": "string", "description": "what you're trying to do and why you're stuck or unsure"}},
          "required": ["situation"]}},
@@ -804,7 +804,27 @@ PLANNER_SYSTEM = (
     "stuck or a move needs real multi-step spatial planning. Think spatially and hand back a short, "
     "concrete plan it can execute. The car has NO map, NO compass or odometry, and open-loop motors: "
     "it cannot turn precise angles or measure distance travelled, so plan in small steps with "
-    "re-checks — never absolute angles or distances. Be concise: a few short numbered steps, no preamble.")
+    "re-checks — never absolute angles or distances. When a camera image is attached, READ THE SCENE "
+    "from it directly — what's where, which way is open, where the goal likely is — and ground your plan "
+    "in what you actually see. Be concise: a few short numbered steps, no preamble.")
+
+
+def grab_frame_b64(maxdim):
+    """Latest camera frame as a base64 JPEG (long edge <= maxdim) for a vision API call, or None."""
+    if not _CV2:
+        return None
+    try:
+        img = cv2.imread(FRAME_PATH)
+        if img is None:
+            return None
+        h0, w0 = img.shape[:2]
+        s = maxdim / float(max(h0, w0))
+        if s < 1.0:
+            img = cv2.resize(img, (int(w0 * s), int(h0 * s)), interpolation=cv2.INTER_AREA)
+        ok, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 85])
+        return base64.b64encode(buf.tobytes()).decode() if ok else None
+    except Exception:
+        return None
 
 
 def call_locator(thing):
@@ -878,14 +898,22 @@ def call_planner(situation, summary, history=None):
                  "different tack, don't just repeat):\n" + "\n".join(
                      "- for \"%s\": %s" % (h["situation"], " ".join(h["plan"].split())[:200])
                      for h in history))
-    user = ("Situation / goal: %s\n\nLive surroundings: %s%s\n\n"
-            "Give a short plan (2-5 numbered steps) using ONLY these actions: scan left/right (turn a "
-            "small step and look), lock_on then go_to (drive to a target that's clearly in view), "
-            "advance (roll up to something and stop), navigate (wander forward around obstacles), drive "
-            "(one small timed nudge), stop. Small steps, re-check as you go." % (situation, summary, prior))
+    frame_b64 = grab_frame_b64(LOCATOR_MAXDIM)   # give the planner the actual camera view to reason over
+    seeing = ("You are looking at the robot's current forward camera view (the attached image).\n\n"
+              if frame_b64 else "")
+    user = ("%sSituation / goal: %s\n\nWhat its sensors report: %s%s\n\n"
+            "Give a short plan (2-5 numbered steps) using ONLY these actions: find_it then go_to (find a "
+            "named thing and drive to it), scan left/right (turn a small step and look), advance (roll up "
+            "to something and stop), navigate (wander forward around obstacles), drive (one small timed "
+            "nudge), stop. Small steps, re-check as you go." % (seeing, situation, summary, prior))
+    content = []
+    if frame_b64:
+        content.append({"type": "image", "source": {"type": "base64",
+                        "media_type": "image/jpeg", "data": frame_b64}})
+    content.append({"type": "text", "text": user})
     body = json.dumps({"model": PLANNER_MODEL, "max_tokens": PLANNER_MAXTOK,
                        "system": PLANNER_SYSTEM,
-                       "messages": [{"role": "user", "content": user}]}).encode()
+                       "messages": [{"role": "user", "content": content}]}).encode()
     req = urllib.request.Request("https://api.anthropic.com/v1/messages", data=body, method="POST")
     req.add_header("x-api-key", key)
     req.add_header("anthropic-version", "2023-06-01")

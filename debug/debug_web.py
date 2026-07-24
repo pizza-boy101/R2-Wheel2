@@ -267,18 +267,12 @@ var logEl=document.getElementById("log");
 function setArm(which){
   fetch("/"+which,{method:"POST"}).then(r=>r.json()).then(function(d){disarmed=!!d.disarmed;poll();}).catch(function(){});
 }
-document.getElementById("armBtn").onclick=function(){
-  if(disarmed){ if(!confirm("ARM the robot? It will be able to move.")) return; setArm("arm"); }
-  else { setArm("disarm"); }
-};
+document.getElementById("armBtn").onclick=function(){ setArm(disarmed?"arm":"disarm"); };
 function setVoice(on){
   fetch("/voice",{method:"POST",headers:{"Content-Type":"text/plain"},body:on?"on":"off"})
     .then(r=>r.json()).then(function(d){voiceOn=(d.voice==="on");poll();}).catch(function(){});
 }
-document.getElementById("voiceBtn").onclick=function(){
-  if(voiceOn){ setVoice(false); }
-  else { if(!confirm("Turn the voice on? It opens the mic and the paid realtime API.")) return; setVoice(true); }
-};
+document.getElementById("voiceBtn").onclick=function(){ setVoice(!voiceOn); };
 // Esc = emergency stop (instant disarm), from anywhere on the page
 document.addEventListener("keydown",function(e){ if(e.key==="Escape"){ e.preventDefault(); setArm("disarm"); } });
 logEl.addEventListener("scroll",function(){atBottom=logEl.scrollHeight-logEl.scrollTop-logEl.clientHeight<40;});
