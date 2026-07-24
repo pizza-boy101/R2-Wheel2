@@ -41,6 +41,7 @@ import os
 import json
 import time
 import signal
+import threading
 import cv2
 import numpy as np
 
@@ -72,7 +73,9 @@ CAM_WIDTH = int(env("CAM_WIDTH", "1280"))
 CAM_HEIGHT = int(env("CAM_HEIGHT", "720"))
 FRAME_WRITE_EVERY = float(env("FRAME_WRITE_EVERY", "0.25"))
 FRAME_QUALITY = int(env("FRAME_QUALITY", "80"))
-FAST_WRITE_EVERY = float(env("FAST_WRITE_EVERY", "0.0"))     # write the small teleop frame EVERY loop (~perception fps)
+FAST_FPS = float(env("FAST_FPS", "30"))                     # teleop feed target fps — written by the camera-reader
+                                                            # thread at the device's native rate, DECOUPLED from the
+                                                            # slower depth loop (lower this if it ever costs perception)
 FAST_MAXDIM = int(env("FAST_MAXDIM", "480"))                 # small long edge: keep frames light so weak Wi-Fi can
 FAST_QUALITY = int(env("FAST_QUALITY", "45"))                # actually deliver the full frame rate to the laptop
 LOG_EVERY = float(env("PERCEPTION_LOG_EVERY", "0.5"))
@@ -111,6 +114,49 @@ def open_camera():
     for _ in range(5):
         cap.read()                                    # let exposure settle
     return cap
+
+
+def camera_reader(shared):
+    """Own the camera on its own thread: grab frames at the device's NATIVE rate into a shared latest-
+    frame slot, and write the small teleop frame_fast.jpg at up to FAST_FPS. This decouples the smooth
+    video feed from the slower depth loop — the loop consumes whatever the newest frame is, while the
+    reader keeps the buffer drained (so no lag) and the teleop feed at ~30 fps. cv2.imencode releases
+    the GIL, so the encode barely touches the depth loop. Reopens the camera on a stall."""
+    cap = open_camera()
+    miss = 0
+    last_fast = 0.0
+    fast_period = 1.0 / FAST_FPS if FAST_FPS > 0 else 0.0
+    while _run:
+        ok, f = cap.read()
+        if not ok or f is None:
+            miss += 1
+            if miss > 30:
+                print("perception: camera stalled, reopening...", flush=True)
+                try:
+                    cap.release()
+                except Exception:
+                    pass
+                cap = open_camera()
+                miss = 0
+            time.sleep(0.03)
+            continue
+        miss = 0
+        shared["frame"] = f                           # atomic ref swap (GIL) — depth loop reads the latest
+        shared["seq"] += 1
+        now = time.time()
+        if now - last_fast >= fast_period:
+            last_fast = now
+            fh, fw = f.shape[:2]
+            fscale = FAST_MAXDIM / float(max(fh, fw))
+            fimg = cv2.resize(f, (int(fw * fscale), int(fh * fscale)),
+                              interpolation=cv2.INTER_AREA) if fscale < 1.0 else f
+            okf, fbuf = cv2.imencode(".jpg", fimg, [cv2.IMWRITE_JPEG_QUALITY, FAST_QUALITY])
+            if okf:
+                atomic_write(FAST_OUT, fbuf.tobytes(), binary=True)
+    try:
+        cap.release()
+    except Exception:
+        pass
 
 
 def _blob(img):
@@ -291,10 +337,16 @@ def main():
     signal.signal(signal.SIGINT, _stop)
     os.environ.setdefault("XDG_RUNTIME_DIR", "/run/user/%d" % os.getuid())
 
-    print("perception: opening camera %d @ %dx%d..." % (CAM_INDEX, CAM_WIDTH, CAM_HEIGHT), flush=True)
-    cap = open_camera()
-    ok, warm = cap.read()
-    if not ok or warm is None:
+    print("perception: opening camera %d @ %dx%d (reader thread, teleop feed %.0f fps)..."
+          % (CAM_INDEX, CAM_WIDTH, CAM_HEIGHT, FAST_FPS), flush=True)
+    shared = {"frame": None, "seq": 0}                # latest camera frame, filled by the reader thread
+    reader = threading.Thread(target=camera_reader, args=(shared,), daemon=True)
+    reader.start()
+    t_wait = time.time()                              # wait for the first frame before warming the depth backend
+    while shared["frame"] is None and _run and time.time() - t_wait < 10.0:
+        time.sleep(0.02)
+    warm = shared["frame"]
+    if warm is None:
         print("perception: FATAL — camera %d gave no frame (is another process holding it?)" % CAM_INDEX, flush=True)
         return
 
@@ -314,7 +366,6 @@ def main():
     period = 1.0 / FPS_CAP if FPS_CAP > 0 else 0.0
     last_log = 0.0
     last_frame_write = 0.0
-    last_fast_write = 0.0
     ema_fps = 0.0
     read_ema = 0.0                            # camera read() time (high => buffer lag / camera-bound)
     infer_ema = 0.0                           # depth inference time
@@ -327,18 +378,11 @@ def main():
 
     while _run:
         loop_t = time.time()
-        ok, img = cap.read()
-        if not ok or img is None:
-            miss += 1
-            if miss > 30:
-                print("perception: camera stalled, reopening...", flush=True)
-                cap.release()
-                cap = open_camera()
-                miss = 0
-            time.sleep(0.03)
+        img = shared["frame"]                         # newest frame from the reader thread (never blocks here)
+        if img is None:
+            time.sleep(0.02)
             continue
-        miss = 0
-        read_ms = (time.time() - loop_t) * 1000.0
+        read_ms = (time.time() - loop_t) * 1000.0     # ~0 now (just a ref grab); reader owns camera timing
         read_ema = read_ms if read_ema == 0 else 0.9 * read_ema + 0.1 * read_ms
         H, W = img.shape[:2]
 
@@ -437,17 +481,7 @@ def main():
             if okj:
                 atomic_write(FRAME_OUT, buf.tobytes(), binary=True)
             last_frame_write = time.time()
-
-        # small, high-rate frame for the dashboard's smooth video feed (teleop). Cheap encode.
-        if time.time() - last_fast_write >= FAST_WRITE_EVERY:
-            fh, fw = img.shape[:2]
-            fscale = FAST_MAXDIM / float(max(fh, fw))
-            fimg = cv2.resize(img, (int(fw * fscale), int(fh * fscale)),
-                              interpolation=cv2.INTER_AREA) if fscale < 1.0 else img
-            okf, fbuf = cv2.imencode(".jpg", fimg, [cv2.IMWRITE_JPEG_QUALITY, FAST_QUALITY])
-            if okf:
-                atomic_write(FAST_OUT, fbuf.tobytes(), binary=True)
-            last_fast_write = time.time()
+        # (the smooth teleop frame_fast.jpg is written by the camera-reader thread, at its own ~30 fps)
 
         if time.time() - last_log >= LOG_EVERY:
             last_log = time.time()
@@ -465,7 +499,7 @@ def main():
             if sleep > 0:
                 time.sleep(sleep)
 
-    cap.release()
+    reader.join(timeout=1.0)                          # reader thread owns the camera now; it releases on _run=False
     try:
         os.remove(STATE)
     except Exception:
