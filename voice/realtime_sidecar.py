@@ -104,6 +104,11 @@ GOTO_RELOCK_EVERY = float(env("GOTO_RELOCK_EVERY", "4.0"))    # periodic backgro
 GOTO_RELOCK_DRIFT = float(env("GOTO_RELOCK_DRIFT", "0.20"))   # re-seed if Claude's box centre is >this (norm) off the
                                                              # tracker's — catches drift onto background before it's lost
 GOTO_RELOCK_MAX_FAILS = int(env("GOTO_RELOCK_MAX_FAILS", "2"))  # give up only after Claude ALSO can't see it this many times
+# pulsed homing: drive in short bursts and PAUSE between them so the tracker reads a sharp frame, instead
+# of trying to track through continuous motion blur (which was making it lose the object while approaching).
+GOTO_PULSE_DRIVE = float(env("GOTO_PULSE_DRIVE", "0.35"))    # forward burst length before pausing to look
+GOTO_PULSE_TURN = float(env("GOTO_PULSE_TURN", "0.2"))       # centring turn burst length before pausing
+GOTO_PULSE_SETTLE = float(env("GOTO_PULSE_SETTLE", "0.3"))   # stop-and-look pause: lets the blur clear for a sharp read
 GOTO_KP = float(env("GOTO_KP", "2.2"))                        # bearing -> turn-rate gain (proportional steering)
 GOTO_WMAX = float(env("GOTO_WMAX", "0.7"))                    # cap on the turn component
 GOTO_SIZE_ARRIVE = float(env("GOTO_SIZE_ARRIVE", "0.30"))    # target filling this frac of frame = we're there
@@ -580,22 +585,29 @@ async def guarded_home(speed, enqueue):
 
                 blocked = (c >= avoid.STOP_NEAR or l >= avoid.SIDE_NEAR
                            or r >= avoid.SIDE_NEAR or loom >= avoid.LOOM_BRAKE)
+                # PULSED homing: one short, timed burst then a pause. The burst self-expires at the
+                # daemon, so during the settle the car is stopped and the next frame is SHARP — that's
+                # the frame the tracker reads. This 'move a little, pause, look' beats trying to track
+                # through continuous motion blur, which was losing the object during the approach.
                 if blocked and not centered:
-                    # obstacle ahead while the target is off to a side -> skirt toward the more open
-                    # side (shared avoidance decides); homing resumes once past it
+                    # obstacle ahead while the target is off to a side -> skirt toward the more open side
                     act, _ = avoid.decide(l, c, r, loom, None, 0.0, now)
                     if act in ("cw", "ccw"):
-                        motor("%s %.2f" % (act, max(0.6, avoid.TURN_SPEED)))
+                        motor("%s %.2f %.2f" % (act, max(0.6, avoid.TURN_SPEED), GOTO_PULSE_TURN))
+                        pulse = GOTO_PULSE_TURN
                     else:
-                        motor("forward %.2f" % max(0.6, avoid.approach_speed(ucm, uvalid, speed)))
+                        motor("forward %.2f %.2f" % (max(0.6, avoid.approach_speed(ucm, uvalid, speed)), GOTO_PULSE_DRIVE))
+                        pulse = GOTO_PULSE_DRIVE
+                elif not centered:
+                    # off to a side -> a short TURN burst toward it (turn sign from the pixel bearing), then look
+                    turn = "cw" if bearing > 0 else "ccw"
+                    motor("%s %.2f %.2f" % (turn, max(0.6, avoid.TURN_SPEED), GOTO_PULSE_TURN))
+                    pulse = GOTO_PULSE_TURN
                 else:
-                    # home: proportional arc — turn toward the target (w), ease forward as it
-                    # centres (vy), and slow on the sonar as we close in
-                    w = max(-GOTO_WMAX, min(GOTO_WMAX, GOTO_KP * bearing))
-                    fwd = avoid.approach_speed(ucm, uvalid, speed)
-                    vy = fwd * max(0.0, 1.0 - abs(bearing) / 0.5)   # face it before charging ahead
-                    motor("raw V 0 %.2f %.2f" % (vy, w))
-                await asyncio.sleep(0.05)
+                    # centred -> a short FORWARD burst (eased by the sonar as we close in), then look
+                    motor("forward %.2f %.2f" % (max(0.6, avoid.approach_speed(ucm, uvalid, speed)), GOTO_PULSE_DRIVE))
+                    pulse = GOTO_PULSE_DRIVE
+                await asyncio.sleep(pulse + GOTO_PULSE_SETTLE)   # burst runs, then a pause for a sharp frame
     except asyncio.CancelledError:
         cancelled = True
         raise
