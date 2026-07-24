@@ -45,7 +45,7 @@ bool INVERT[4] = { true, true, false, false };  // FL,FR reversed-polarity -> fl
 // right, i.e. the left side outruns the right, so the left wheels (FL=0, RL=2) run a touch
 // slower. This is a fixed correction (no encoder feedback), so re-tune if it drifts again after
 // a battery/surface change. 1.0 = full; lower = slower.  index: 0=FL 1=FR 2=RL 3=RR
-float TRIM[4] = { 0.93, 1.00, 0.93, 1.00 };
+float TRIM[4] = { 0.90, 1.00, 0.90, 1.00 };
 
 // HC-SR04 forward ultrasonic (mounted under the camera, facing forward). All 12 digital
 // pins are taken by the two L298Ns, so it lives on the analog pins driven as digital:
