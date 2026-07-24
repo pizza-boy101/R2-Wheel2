@@ -100,6 +100,10 @@ def open_camera():
     cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAM_WIDTH)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAM_HEIGHT)
+    try:
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)           # keep only the latest frame -> frame.jpg tracks real
+    except Exception:                                 # time instead of lagging a buffered queue (kills the
+        pass                                          # "box shows where it WAS" afterimage during go_to)
     for _ in range(5):
         cap.read()                                    # let exposure settle
     return cap

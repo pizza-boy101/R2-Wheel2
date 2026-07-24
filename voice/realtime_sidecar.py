@@ -106,9 +106,14 @@ GOTO_RELOCK_DRIFT = float(env("GOTO_RELOCK_DRIFT", "0.20"))   # re-seed if Claud
 GOTO_RELOCK_MAX_FAILS = int(env("GOTO_RELOCK_MAX_FAILS", "2"))  # give up only after Claude ALSO can't see it this many times
 # pulsed homing: drive in short bursts and PAUSE between them so the tracker reads a sharp frame, instead
 # of trying to track through continuous motion blur (which was making it lose the object while approaching).
-GOTO_PULSE_DRIVE = float(env("GOTO_PULSE_DRIVE", "0.35"))    # forward burst length before pausing to look
-GOTO_PULSE_TURN = float(env("GOTO_PULSE_TURN", "0.2"))       # centring turn burst length before pausing
-GOTO_PULSE_SETTLE = float(env("GOTO_PULSE_SETTLE", "0.3"))   # stop-and-look pause: lets the blur clear for a sharp read
+GOTO_PULSE_DRIVE = float(env("GOTO_PULSE_DRIVE", "0.3"))     # forward burst length before pausing to look
+GOTO_PULSE_TURN = float(env("GOTO_PULSE_TURN", "0.18"))      # MAX centring turn burst; scaled down near centre so a
+                                                             # single step never swings past where the (1-2s old) box
+                                                             # said the thing was -> no chasing the 'afterimage'
+GOTO_PULSE_TURN_MIN = float(env("GOTO_PULSE_TURN_MIN", "0.07"))  # floor so a tiny turn still actually moves the wheels
+GOTO_HOME_TURN_SPEED = float(env("GOTO_HOME_TURN_SPEED", "0.6"))  # gentle turn (motor floor) so centring doesn't overshoot
+GOTO_PULSE_SETTLE = float(env("GOTO_PULSE_SETTLE", "0.45"))  # stop-and-look pause: let motion stop AND a fresh frame land
+                                                             # before Claude looks, so it reads NOW, not a frame ago
 GOTO_KP = float(env("GOTO_KP", "2.2"))                        # bearing -> turn-rate gain (proportional steering)
 GOTO_WMAX = float(env("GOTO_WMAX", "0.7"))                    # cap on the turn component
 GOTO_SIZE_ARRIVE = float(env("GOTO_SIZE_ARRIVE", "0.30"))    # target filling this frac of frame = we're there
@@ -577,10 +582,14 @@ async def guarded_home(speed, enqueue):
                         motor("forward %.2f %.2f" % (max(0.6, avoid.approach_speed(ucm, uvalid, speed)), GOTO_PULSE_DRIVE))
                         pulse = GOTO_PULSE_DRIVE
                 elif not centered:
-                    # off to a side -> a short TURN burst toward it (turn sign from the pixel bearing), then look
+                    # off to a side -> a short, GENTLE turn toward it, its length SCALED by how far off
+                    # centre we are: big correction when way off, a hair when nearly lined up. That keeps
+                    # one step from swinging past the thing before the next (1-2s later) look lands.
                     turn = "cw" if bearing > 0 else "ccw"
-                    motor("%s %.2f %.2f" % (turn, max(0.6, avoid.TURN_SPEED), GOTO_PULSE_TURN))
-                    pulse = GOTO_PULSE_TURN
+                    frac = min(1.0, abs(bearing) / 0.35)
+                    tsecs = max(GOTO_PULSE_TURN_MIN, GOTO_PULSE_TURN * frac)
+                    motor("%s %.2f %.2f" % (turn, GOTO_HOME_TURN_SPEED, tsecs))
+                    pulse = tsecs
                 else:
                     # centred -> a short FORWARD burst (eased by the sonar as we close in), then look
                     motor("forward %.2f %.2f" % (max(0.6, avoid.approach_speed(ucm, uvalid, speed)), GOTO_PULSE_DRIVE))
