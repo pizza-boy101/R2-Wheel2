@@ -177,14 +177,12 @@ INSTRUCTIONS = (
     "saw it on one side, scan that way. Look at each photo; if what you're after isn't in it, scan again, "
     "step by step (a full turn is several scans). Getting it CLEARLY in view AND centered matters: if it "
     "first shows up as just a sliver at the edge of the frame, you've only caught the very start of it — do "
-    "NOT act yet. Once it IS in view but sitting off to one side, switch to small centring nudges and turn "
-    "TOWARD THE THING — the SAME side it's on: if it's on the RIGHT of the frame, scan 'center' to the RIGHT; "
-    "if it's on the LEFT, scan 'center' to the LEFT. This is a plain rule — don't reason about which way the "
-    "picture slides, just turn toward the side the thing is on. It will usually mean REVERSING your sweep "
-    "direction, and that's correct: the keep-scanning-the-same-way rule is for searching, NOT for centring, so "
-    "drop it the moment the thing is in view. One nudge at a time, read the photo, repeat until it sits in the "
-    "middle; stop the instant it's centred so you don't overshoot past it. Only THEN either say what it is or "
-    "head toward it. Don't take big blind turns to "
+    "NOT act yet. Once it IS in view and roughly ahead, switch to centring: call scan 'center'. It locks on "
+    "and turns the correct way BY ITSELF — you do NOT pick a side, and you do NOT reason about which way to "
+    "turn. Just call scan 'center' again and again, reading each photo, until it tells you the thing is "
+    "centred; then say what it is or go to it. If it says it couldn't lock on (the thing's near the edge), "
+    "sweep one 'step' toward it to bring it inward, then centre again. Only once it's centred do you act. "
+    "Don't take big blind turns to "
     "search. Chain the scans yourself — scan, read the view, decide, scan again — without waiting to be "
     "prompted. IMPORTANT — don't give up early: a few steps only covers a small arc, and something behind "
     "you takes about half a full circle of steps to come into view. Keep scanning the SAME direction, step "
@@ -236,10 +234,10 @@ TOOLS = [
      "description": "Attach a fresh photo from the robot's forward camera so you can see the scene with your own eyes. Call before moving toward something or when asked what you see.",
      "parameters": {"type": "object", "properties": {}, "required": []}},
     {"type": "function", "name": "scan",
-     "description": "Look around for something. The FIRST scan of a search hands you the view from where you already are WITHOUT moving — look at it first. Each scan after that turns the car and hands you a fresh camera view, so calling scan again means 'I've looked at that view, keep going.' Two step sizes via amount: 'step' (default) turns about one camera-width so each new view picks up right where the last one ended — use this to sweep a room; 'center' turns just a hair — use this ONCE THE THING IS ALREADY IN VIEW but off to one side: set direction to the SAME side the thing is on (on the right of the frame → direction right) and repeat a touch at a time until it sits in the middle, then lock on and go to it. Centring usually means reversing your sweep direction — do it anyway; the keep-the-same-direction habit is only for searching. Always read each photo and decide before scanning again. When sweeping, pick the direction deliberately toward where the thing should be. Never use big blind turns to search.",
+     "description": "Look around for something. The FIRST scan of a search hands you the view from where you already are WITHOUT moving — look at it first. Each scan after that turns the car and hands you a fresh camera view, so calling scan again means 'I've looked at that view, keep going.' Two step sizes via amount: 'step' (default) turns about one camera-width so each new view picks up right where the last one ended — use this to sweep a room; 'center' AUTO-centres on the thing — use it once the thing is in view and roughly ahead (not jammed against an edge). It locks on and turns the correct way BY ITSELF using the camera, so you do NOT choose a side; just call scan 'center' again and again until it tells you the thing is centred, then go to it. (If it says it couldn't lock on, the thing is too near the edge — sweep one 'step' toward it first.) Always read each photo and decide before scanning again. When sweeping, pick the direction deliberately toward where the thing should be. Never use big blind turns to search.",
      "parameters": {"type": "object", "properties": {
          "direction": {"type": "string", "enum": ["left", "right"],
-                       "description": "which way to turn — left or right (default right). For a 'center' nudge, use the SAME side the target is on (target on the right of the frame → right)"},
+                       "description": "which way to turn — left or right (default right). Used for sweeping ('step'); IGNORED for 'center', which turns the correct way by itself"},
          "amount": {"type": "string", "enum": ["step", "center"],
                     "description": "'step' = a full camera-width sweep step (default); 'center' = a tiny centring nudge for a target that's already in view but off to one side"}},
          "required": []}},
@@ -970,28 +968,48 @@ async def main():
                             prev_last = scan_st["last"]
                             scan_st["last"] = now_m
                             if amount == "center":
-                                # fine-centering: a tiny nudge to slide an already-seen target toward the
-                                # middle. Lightly paced (NOT the full sweep floor) so it converges in a few
-                                # taps, and it doesn't count toward the full-circle sweep.
-                                if not disarmed:
-                                    wait = SCAN_NUDGE_INTERVAL - (now_m - scan_st["last_turn"])
-                                    if wait > 0:
-                                        await asyncio.sleep(wait)
-                                    scan_st["last_turn"] = time.monotonic()
-                                    motor("%s %.2f %.2f" % (turn, SCAN_TURN_SPEED, SCAN_NUDGE_SECS))
-                                    await asyncio.sleep(SCAN_NUDGE_SECS + SCAN_NUDGE_SETTLE)
-                                else:
-                                    await asyncio.sleep(SCAN_NUDGE_SETTLE)
-                                durl = await to_thread(frame_data_url, LOOK_MAXDIM, LOOK_QUALITY)
+                                # AUTO-centre off the tracker's pixel-measured bearing, NOT the model's
+                                # left/right (which it gets wrong). Lock on first if needed (a centred box
+                                # captures a roughly-central target), then turn toward the measured bearing
+                                # a hair at a time. The model just calls this until it's told 'centred'.
                                 if disarmed:
-                                    note = "kill switch is on — I can't nudge, but here's the current view"
+                                    await asyncio.sleep(SCAN_NUDGE_SETTLE)
+                                    durl = await to_thread(frame_data_url, LOOK_MAXDIM, LOOK_QUALITY)
+                                    note = "kill switch is on — I can't centre, but here's the current view"
                                     cap = "Current camera view (can't turn — kill switch on):"
                                 else:
-                                    note = ("nudged a hair %s. Look where the target is NOW: if it's centred, lock "
-                                            "on and go to it (or say what it is); if it's still off to a side, scan "
-                                            "'center' toward whichever side it's on now (right→right, left→left) — "
-                                            "stop the moment it's centred, don't overshoot." % side)
-                                    cap = "Camera view after a small centring nudge %s:" % side
+                                    tg = read_target()
+                                    if not (tg and tg.get("active")):
+                                        seed_goal("target", "medium")   # centred box -> locks a roughly-central target
+                                        for _ in range(12):              # give the tracker a few frames to grab it
+                                            await asyncio.sleep(0.08)
+                                            tg = read_target()
+                                            if tg and tg.get("active"):
+                                                break
+                                    if tg and tg.get("active") and not tg.get("lost"):
+                                        bearing = tg.get("bearing", 0.0)   # pixel-measured: - = left, + = right
+                                        if abs(bearing) <= GOTO_BEAR_DEAD:
+                                            durl = await to_thread(frame_data_url, LOOK_MAXDIM, LOOK_QUALITY)
+                                            note = "it's centred now and I'm locked on — say what it is, or go to it."
+                                            cap = "Camera view — target centred:"
+                                        else:
+                                            autoside = "right" if bearing > 0 else "left"
+                                            turn = "cw" if bearing > 0 else "ccw"   # toward its TRUE side (bearing sign)
+                                            wait = SCAN_NUDGE_INTERVAL - (now_m - scan_st["last_turn"])
+                                            if wait > 0:
+                                                await asyncio.sleep(wait)
+                                            scan_st["last_turn"] = time.monotonic()
+                                            motor("%s %.2f %.2f" % (turn, SCAN_TURN_SPEED, SCAN_NUDGE_SECS))
+                                            await asyncio.sleep(SCAN_NUDGE_SECS + SCAN_NUDGE_SETTLE)
+                                            durl = await to_thread(frame_data_url, LOOK_MAXDIM, LOOK_QUALITY)
+                                            note = ("centring on it automatically (it's to the %s of centre) — scan "
+                                                    "'center' again to keep going; I'll tell you when it's centred." % autoside)
+                                            cap = "Camera view after an auto-centring nudge %s:" % autoside
+                                    else:
+                                        durl = await to_thread(frame_data_url, LOOK_MAXDIM, LOOK_QUALITY)
+                                        note = ("couldn't lock on to centre it — it's probably too near the edge. Sweep "
+                                                "one 'step' toward it to bring it inward, then scan 'center' again.")
+                                        cap = "Current camera view (no lock to centre on):"
                             else:
                                 fresh_sweep = (now_m - prev_last) > SCAN_SWEEP_GAP
                                 if fresh_sweep:
