@@ -130,6 +130,31 @@ GOTO_WMAX = float(env("GOTO_WMAX", "0.7"))                    # cap on the turn 
 GOTO_SIZE_ARRIVE = float(env("GOTO_SIZE_ARRIVE", "0.22"))    # target filling this frac of frame = we're there
 GOTO_ARRIVE_Y = float(env("GOTO_ARRIVE_Y", "0.80"))          # target's bottom edge this far down the frame = it's at
                                                              # the robot's feet (floor objects drop low as you close in)
+# --- sonar-guarded DASH: on a long clear straightaway, drive continuously (no per-step Claude call)
+# under a fast local sonar/camera guard, to cut the ~1-2s-per-step Claude cost on the approach. It only
+# ever goes STRAIGHT (never turns blind), only off a FRESH centred fix on a far target, hands back at
+# 60cm (never enters the ~35cm standoff), and is hard-capped blind for a sonar-invisible target.
+GOTO_DASH_ENABLE = env("GOTO_DASH_ENABLE", "1") == "1"       # master switch (0 = pure pulsed homing)
+GOTO_DASH_SIZE_MAX = float(env("GOTO_DASH_SIZE_MAX", "0.06"))    # only dash when the target is this small in frame (far)
+GOTO_DASH_MAX_BOTTOM = float(env("GOTO_DASH_MAX_BOTTOM", "0.55"))  # AND its bottom edge is this HIGH in frame. size alone
+                                                                  # is a bad 'far' proxy — a physically small ball stays
+                                                                  # tiny even up close; but a floor object that's genuinely
+                                                                  # far sits HIGH (small box_bottom), a close one sits low.
+                                                                  # This stops the dash running over a close small ball.
+GOTO_DASH_BEAR_DEAD = float(env("GOTO_DASH_BEAR_DEAD", "0.08"))  # must be this centred to START (tighter than the drive band)
+GOTO_DASH_MIN_CLEAR_CM = float(env("GOTO_DASH_MIN_CLEAR_CM", "120"))  # need a FRESH VALID sonar runway >= this to enter
+GOTO_DASH_STOP_CM = float(env("GOTO_DASH_STOP_CM", "60"))       # hand back to the slow fine loop when sonar drops to this
+GOTO_DASH_SONAR_FRESH = float(env("GOTO_DASH_SONAR_FRESH", "0.2"))  # abort if the sonar reading is older than this
+GOTO_DASH_MAX_CM = float(env("GOTO_DASH_MAX_CM", "60"))        # HARD blind-distance cap per dash — kept short so even if
+                                                              # the far-gate is fooled, an overshoot stays recoverable
+GOTO_DASH_MAX_SECS = float(env("GOTO_DASH_MAX_SECS", "1.5"))   # hard wall-clock backstop per dash
+GOTO_DASH_SPEED_CMS = float(env("GOTO_DASH_SPEED_CMS", "70"))  # CALIBRATE ON FLOOR: HIGH estimate of full-speed cm/s so
+                                                              # the distance cap over-counts travel and fires early
+GOTO_DASH_POLL = float(env("GOTO_DASH_POLL", "0.05"))         # dash inner-loop poll period (~20Hz)
+GOTO_DASH_BURST = float(env("GOTO_DASH_BURST", "0.2"))        # self-expiring forward burst re-issued each tick (dead loop
+                                                             # -> daemon stops the car within this)
+GOTO_LOC_MAXDIM_FAR = int(env("GOTO_LOC_MAXDIM_FAR", "512"))  # locator frame size for coarse cruise steering (~4x faster)
+GOTO_RES_NEAR_SIZE = float(env("GOTO_RES_NEAR_SIZE", "0.10")) # at/above this frame-fraction, use full res for precise aim
 LOCK_BOX = {"small": (0.16, 0.20), "medium": (0.30, 0.36), "large": (0.50, 0.56)}  # centred seed-box (w,h)
 # scan = "turn a small step, then look" — the search primitive (spin-until-you-see-it). Deliberately
 # a small step so it doesn't overshoot; the model calls it repeatedly and reads the photo each time.
@@ -534,6 +559,8 @@ async def guarded_home(speed, enqueue):
     label = read_goal_label() or "the target"     # what find_it locked; what we re-find each step
     fails = 0
     last_bearing = 0.0                             # last bearing we actually saw -> commit toward it through misses
+    loc_maxdim = LOCATOR_MAXDIM                    # locator frame size for the NEXT look: full res to (re)acquire,
+                                                   # small (fast) once cruising on a solid far fix
     try:
         tg = read_target()
         if not (tg and tg.get("active")):
@@ -559,7 +586,7 @@ async def guarded_home(speed, enqueue):
                 # silently re-latches on random texture and its bearing spins the car. Claude either
                 # finds the thing or says not-found; it never hands back a random jump. We still re-seed
                 # the tracker from Claude's box so the dashboard overlay stays honest.
-                box = await to_thread(call_locator, label)
+                box = await to_thread(call_locator, label, loc_maxdim)
                 size = 0.0
                 box_bottom = 0.0
                 if box is not None:
@@ -572,6 +599,12 @@ async def guarded_home(speed, enqueue):
                     box_bottom = box[1] + box[3]              # how low the thing sits in frame; floor objects drop
                                                               # toward the bottom as we close in on them
                     last_bearing = bearing
+                    # next look: full res for the precise final aim, fast small frame while cruising far. 'Near' mirrors
+                    # the ARRIVAL signals (size, low-in-frame box_bottom, or sonar) so a small FLOOR object — which
+                    # arrives via box_bottom, not size — still gets full res for its final approach.
+                    near_now = (size >= GOTO_RES_NEAR_SIZE or box_bottom >= GOTO_ARRIVE_Y
+                                or avoid.ultra_blocked(ucm, uvalid))
+                    loc_maxdim = LOCATOR_MAXDIM if near_now else GOTO_LOC_MAXDIM_FAR
                     # 'centred enough to drive' — loose when the thing is far/small (close the distance first),
                     # tightening to GOTO_BEAR_DEAD as it fills the frame (fine aim only when it's near). So it
                     # drives AT a roughly-ahead target and saves microadjustments for when it's close & accurate.
@@ -587,6 +620,7 @@ async def guarded_home(speed, enqueue):
                     # missed it this look (small/far things blink out after a move). DON'T quit — commit
                     # toward where we last saw it and re-check as we close in (bigger = easier to spot).
                     fails += 1
+                    loc_maxdim = LOCATOR_MAXDIM                # a miss -> full res next look to re-acquire
                     write_locate(label, False, None, False)
                     if avoid.ultra_blocked(ucm, uvalid) and abs(last_bearing) < GOTO_BEAR_DEAD:
                         reason = "I'm right up next to it"; break   # lined up and something's right ahead
@@ -623,7 +657,49 @@ async def guarded_home(speed, enqueue):
                     motor("%s %.2f %.2f" % (turn, GOTO_HOME_TURN_SPEED, tsecs))
                     pulse = tsecs
                 else:
-                    # centred -> a short FORWARD burst (eased by the sonar as we close in), then look
+                    # centred -> normally a short forward burst. BUT if this is a FRESH far/centred fix with a
+                    # long CLEAR metric runway, DASH: drive straight continuously under a fast local sonar+camera
+                    # guard (NO Claude call) to close the distance quickly, then hand back to the fine loop to
+                    # re-centre. The dash never turns and never runs blind — see the entry gate + guards below.
+                    cam_clear = (loom < avoid.LOOM_BRAKE and l < avoid.SIDE_NEAR and r < avoid.SIDE_NEAR)
+                    if (GOTO_DASH_ENABLE and box is not None and cam_clear
+                            and size < GOTO_DASH_SIZE_MAX and box_bottom < GOTO_DASH_MAX_BOTTOM
+                            and abs(bearing) < GOTO_DASH_BEAR_DEAD
+                            and uvalid and ucm is not None and ucm >= GOTO_DASH_MIN_CLEAR_CM):
+                        dash_start = time.monotonic()
+                        dwhy = "?"
+                        while True:
+                            dnow = time.monotonic()
+                            if os.path.exists(DISARM):
+                                dwhy = "disarm"; break                 # kill switch -> hand back; outer loop reports it
+                            if dnow - start > GOTO_MAX_SECS:
+                                dwhy = "timecap"; break                # outer 60s cap, re-checked every tick
+                            delapsed = dnow - dash_start
+                            if delapsed > GOTO_DASH_MAX_SECS:
+                                dwhy = "maxsecs"; break                # wall-clock backstop
+                            if delapsed * GOTO_DASH_SPEED_CMS >= GOTO_DASH_MAX_CM:
+                                dwhy = "maxdist"; break                # HARD blind-distance cap (sonar-invisible target)
+                            dcm, dvalid, dage = read_ultra_dash()
+                            if dage > GOTO_DASH_SONAR_FRESH or not dvalid or dcm is None:
+                                dwhy = "sonar-stale"; break            # never advance on a stale/dead sonar
+                            if dcm <= GOTO_DASH_STOP_CM or avoid.ultra_blocked(dcm, dvalid):
+                                dwhy = "near"; break                   # hand the final 60->35cm approach to the fine loop
+                            dst = read_nav_state()
+                            if dst is None:
+                                dwhy = "no-cam"; break                 # lost camera feed
+                            dn = dst.get("near", {}) or {}
+                            if ((dst.get("loom", 0) or 0) >= avoid.LOOM_BRAKE
+                                    or dn.get("l", 0) >= avoid.SIDE_NEAR or dn.get("r", 0) >= avoid.SIDE_NEAR):
+                                dwhy = "obstacle"; break               # off-axis/looming obstacle the sonar cone may miss
+                            # self-expiring timed burst: if this loop stalls/dies the daemon stops the car within
+                            # GOTO_DASH_BURST (well under the dead-man), and the sonar taper eases speed near SLOW_CM
+                            motor("forward %.2f %.2f" % (max(0.6, avoid.approach_speed(dcm, dvalid, speed)), GOTO_DASH_BURST))
+                            await asyncio.sleep(GOTO_DASH_POLL)        # cancellation point (stop -> CancelledError -> finally)
+                        motor("stop")
+                        log("go_to: DASH end (%s) %.2fs" % (dwhy, time.monotonic() - dash_start))
+                        await asyncio.sleep(GOTO_PULSE_SETTLE)         # let motion stop + a sharp frame land
+                        continue                                       # back to the fine loop to re-centre / re-check
+                    # not dashing -> the existing short forward burst
                     motor("forward %.2f %.2f" % (max(0.6, avoid.approach_speed(ucm, uvalid, speed)), GOTO_PULSE_DRIVE))
                     pulse = GOTO_PULSE_DRIVE
                 await asyncio.sleep(pulse + GOTO_PULSE_SETTLE)   # burst runs, then a pause for a sharp frame
@@ -729,6 +805,18 @@ def read_ultra():
         return u.get("cm"), bool(u.get("valid"))
     except Exception:
         return None, False
+
+
+def read_ultra_dash():
+    """Like read_ultra but ALSO returns the reading's age -> (cm, valid, age_secs). The dash needs the
+    age so it can enforce its own stricter freshness (GOTO_DASH_SONAR_FRESH) than ULTRA_FRESH, and abort
+    the instant the sonar feed goes quiet. Missing/unparseable -> (None, False, 999.0)."""
+    try:
+        with open(ULTRA) as f:
+            u = json.load(f)
+        return u.get("cm"), bool(u.get("valid")), time.time() - u.get("ts", 0)
+    except Exception:
+        return None, False, 999.0
 
 
 def seed_box(box, label):
@@ -859,7 +947,7 @@ def grab_frame_b64(maxdim):
         return None
 
 
-def call_locator(thing):
+def call_locator(thing, maxdim=LOCATOR_MAXDIM):
     """Ask Claude (Opus vision) for a bounding box of `thing` in the CURRENT frame. Returns a
     normalized [x,y,w,h] box to seed the tracker with, or None if Claude can't see it / on any
     failure (the caller then sweeps and retries). Blocking — run via to_thread."""
@@ -874,7 +962,7 @@ def call_locator(thing):
         if img is None:
             return None
         h0, w0 = img.shape[:2]
-        scale = LOCATOR_MAXDIM / float(max(h0, w0))
+        scale = maxdim / float(max(h0, w0))
         if scale < 1.0:
             img = cv2.resize(img, (int(w0 * scale), int(h0 * scale)), interpolation=cv2.INTER_AREA)
         H, W = img.shape[:2]
