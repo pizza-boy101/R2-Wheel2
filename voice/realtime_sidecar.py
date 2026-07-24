@@ -115,10 +115,11 @@ GOTO_RELOCK_MAX_FAILS = int(env("GOTO_RELOCK_MAX_FAILS", "2"))  # give up only a
 # pulsed homing: drive in short bursts and PAUSE between them so the tracker reads a sharp frame, instead
 # of trying to track through continuous motion blur (which was making it lose the object while approaching).
 GOTO_PULSE_DRIVE = float(env("GOTO_PULSE_DRIVE", "0.45"))    # forward burst length — longer so it closes distance
-GOTO_PULSE_TURN = float(env("GOTO_PULSE_TURN", "0.10"))      # MAX centring turn burst; scaled down near centre so a
+GOTO_PULSE_TURN = float(env("GOTO_PULSE_TURN", "0.08"))      # MAX centring turn burst; scaled down near centre so a
                                                              # single step never swings past where the (1-2s old) box
                                                              # said the thing was -> no chasing the 'afterimage'
-GOTO_PULSE_TURN_MIN = float(env("GOTO_PULSE_TURN_MIN", "0.06"))  # floor so a tiny turn still actually moves the wheels
+GOTO_PULSE_TURN_MIN = float(env("GOTO_PULSE_TURN_MIN", "0.05"))  # floor so a tiny turn still actually moves the wheels
+                                                                 # (at full speed a 0.05s flick still breaks friction)
 GOTO_HOME_TURN_SPEED = float(env("GOTO_HOME_TURN_SPEED", "1.0"))  # FULL speed: a short low-speed pulse can't overcome
                                                                  # the wheels' static friction (it just doesn't move) —
                                                                  # a crisp full-speed flick for a tiny time actually nudges
